@@ -1,0 +1,38 @@
+# Python
+backend/venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Model artifacts and local database
+backend/probmail.db
+backend/models/*.joblib
+backend/models/*.json
+!backend/models/.gitkeep
+
+# Node / Frontend
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+*.log
+
+# AI Studio artifacts / internals
+.aistudio/
+
+# Environment variables
+.env
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db
+

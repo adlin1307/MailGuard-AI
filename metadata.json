@@ -1,0 +1,6 @@
+{
+  "name": "ProbMail - Email Security & Bayesian Spam Classifier",
+  "description": "Intelligent spam and ham email classification platform with Bayesian conditional probabilities, Chi-Square feature selection, explainable risk scoring, and PDF audit reports.",
+  "permissions": [],
+  "capabilities": []
+}
