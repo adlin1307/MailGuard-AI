@@ -1,5 +1,6 @@
 import { mlEngine } from './ml-engine';
 import { User, authService } from './auth-service';
+import { api, getStoredAuthToken } from './api';
 
 export interface MailItem {
   id: string;
@@ -25,11 +26,39 @@ export interface MailItem {
 const STORAGE_KEY = 'probmail_mailbox_v2';
 
 class MailService {
+  private isConfirmedDemoMessage(m: MailItem): boolean {
+    if (!m) return false;
+    const fromName = (m.fromName || '').toLowerCase().trim();
+    const fromEmail = (m.fromEmail || '').toLowerCase().trim();
+    const subject = (m.subject || '').toLowerCase().trim();
+
+    // Confirmed seeded demo senders
+    if (fromName === 'security operations center' || fromEmail === 'soc-alerts@internal.org') return true;
+    if (fromName === 'david miller' || fromEmail === 'david.miller@workplace.net') return true;
+    if (fromName === 'global mega rewards' || fromEmail === 'promo-claim@fast-cash-rewards.xyz') return true;
+
+    // Confirmed seeded demo subjects
+    if (subject.includes('scheduled security patching window')) return true;
+    if (subject.includes('sprint retrospective agenda')) return true;
+    if (subject.includes('urgent: you won $5,000,000')) return true;
+    if (subject.includes('confirm your payroll direct deposit details')) return true;
+    if (subject.includes('antivirus subscription renewal invoice')) return true;
+
+    return false;
+  }
+
   private getStoredMessages(): MailItem[] {
     try {
       const data = localStorage.getItem(STORAGE_KEY);
       if (!data) return [];
-      return JSON.parse(data);
+      const messages: MailItem[] = JSON.parse(data);
+      if (!Array.isArray(messages)) return [];
+
+      const filtered = messages.filter((m) => !this.isConfirmedDemoMessage(m));
+      if (filtered.length !== messages.length) {
+        this.saveMessages(filtered);
+      }
+      return filtered;
     } catch {
       return [];
     }
@@ -43,48 +72,30 @@ class MailService {
     }
   }
 
-  // Seed default demonstration emails for a user so inbox isn't blank
-  public ensureSeedForUser(user: User): void {
-    const all = this.getStoredMessages();
-    const userMails = all.filter((m) => m.toEmail.toLowerCase() === user.email.toLowerCase());
-    if (userMails.length > 0) return;
+  constructor() {
+    this.cleanLegacyDemoMessages();
+  }
 
-    // Create 3 realistic sample emails automatically classified by Bayesian ML
-    const sample1 = this.createMailRecord(
-      'Security Operations Center',
-      'soc-alerts@internal.org',
-      user.name,
-      user.email,
-      'Scheduled Security Patching Window: Tonight at 22:00 UTC',
-      'Hello team,\n\nPlease be advised that routine server maintenance and database indexing will occur tonight from 22:00 to 22:30 UTC. No downtime is anticipated for production services.\n\nBest regards,\nSecOps Infrastructure Team',
-      new Date(Date.now() - 3600 * 1000 * 2).toISOString(),
-      true
-    );
+  private cleanLegacyDemoMessages(): void {
+    try {
+      const data = localStorage.getItem(STORAGE_KEY);
+      if (!data) return;
+      const messages: MailItem[] = JSON.parse(data);
+      if (!Array.isArray(messages)) return;
 
-    const sample2 = this.createMailRecord(
-      'Global Mega Rewards',
-      'promo-claim@fast-cash-rewards.xyz',
-      user.name,
-      user.email,
-      'URGENT: You won $5,000,000 Cash Prize! Claim Within 24 Hours',
-      'CONGRATULATIONS WINNER!\n\nYour email address has been selected as the grand cash recipient of $5,000,000 USD! Click the link below immediately to claim your funds transfer:\nhttp://claim-free-funds-now.cc/verify-bank-account\n\nFailure to reply with your account details in 24 hours will forfeit your million dollar prize.',
-      new Date(Date.now() - 3600 * 1000 * 5).toISOString(),
-      false
-    );
+      const genuineMessages = messages.filter((m) => !this.isConfirmedDemoMessage(m));
+      if (genuineMessages.length !== messages.length) {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(genuineMessages));
+      }
+    } catch {
+      // ignore
+    }
+  }
 
-    const sample3 = this.createMailRecord(
-      'David Miller',
-      'david.miller@workplace.net',
-      user.name,
-      user.email,
-      'Sprint retrospective agenda & project timeline updates',
-      'Hey,\n\nI reviewed the pull requests for the email filtering engine. The test coverage looks solid and the confusion matrix metrics are looking great. Let us discuss during the standup.\n\nCheers,\nDavid',
-      new Date(Date.now() - 3600 * 1000 * 18).toISOString(),
-      true
-    );
-
-    all.push(sample1, sample2, sample3);
-    this.saveMessages(all);
+  // Demonstration emails disabled so new inboxes start clean
+  public ensureSeedForUser(_user: User): void {
+    // No-op: automatic sample email injection disabled per submission priorities
+    return;
   }
 
   private createMailRecord(
@@ -97,7 +108,8 @@ class MailService {
     timestamp: string,
     isRead: boolean = false
   ): MailItem {
-    const pred = mlEngine.predictEmail(subject, body);
+    // Use recordHistory = false so dispatching/storing mail does not pollute the email scan audit log
+    const pred = mlEngine.predictEmail(subject, body, false);
     const isSpam = pred.predicted_class === 'spam';
     return {
       id: `mail_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
@@ -184,22 +196,72 @@ class MailService {
     const recipientUser = registeredUsers.find((u) => u.email.toLowerCase() === trimmedTo);
     const toName = recipientUser ? recipientUser.name : trimmedTo.split('@')[0];
 
-    const newMail = this.createMailRecord(
-      from.name,
-      from.email,
-      toName,
-      trimmedTo,
-      subject,
-      body,
-      new Date().toISOString(),
-      false
-    );
+    // Attempt backend persistence for shared cross-browser delivery
+    let savedMail: MailItem | null = null;
+    if (getStoredAuthToken()) {
+      try {
+        const res = await api.sendMailboxMessage({
+          recipient_email: trimmedTo,
+          recipient_name: toName,
+          subject: subject.trim(),
+          body: body.trim(),
+        });
+        if (res?.mail) {
+          savedMail = res.mail;
+        }
+      } catch (err: any) {
+        console.warn('Backend mailbox delivery warning:', err?.message);
+      }
+    }
+
+    if (!savedMail) {
+      savedMail = this.createMailRecord(
+        from.name,
+        from.email,
+        toName,
+        trimmedTo,
+        subject,
+        body,
+        new Date().toISOString(),
+        false
+      );
+    }
 
     const messages = this.getStoredMessages();
-    messages.push(newMail);
+    messages.push(savedMail);
     this.saveMessages(messages);
 
-    return newMail;
+    return savedMail;
+  }
+
+  public async syncWithBackend(): Promise<void> {
+    if (!getStoredAuthToken()) return;
+    try {
+      const [inboxRes, spamRes, sentRes] = await Promise.all([
+        api.getInboxMessages().catch(() => null),
+        api.getSpamMessages().catch(() => null),
+        api.getSentMessages().catch(() => null),
+      ]);
+      const backendMsgs: MailItem[] = [];
+      if (inboxRes?.messages) backendMsgs.push(...inboxRes.messages);
+      if (spamRes?.messages) backendMsgs.push(...spamRes.messages);
+      if (sentRes?.messages) backendMsgs.push(...sentRes.messages);
+
+      if (backendMsgs.length > 0) {
+        const local = this.getStoredMessages();
+        const map = new Map<string, MailItem>();
+        for (const m of local) map.set(m.id, m);
+        for (const m of backendMsgs) {
+          map.set(m.id, {
+            ...map.get(m.id),
+            ...m,
+          });
+        }
+        this.saveMessages(Array.from(map.values()));
+      }
+    } catch {
+      // offline or backend error, use local
+    }
   }
 
   public markAsRead(id: string): void {
@@ -208,6 +270,9 @@ class MailService {
     if (item && !item.isRead) {
       item.isRead = true;
       this.saveMessages(messages);
+      if (getStoredAuthToken()) {
+        api.markMailboxRead(id).catch(() => {});
+      }
     }
   }
 
@@ -217,6 +282,9 @@ class MailService {
     if (item) {
       item.starred = !item.starred;
       this.saveMessages(messages);
+      if (getStoredAuthToken()) {
+        api.toggleMailboxStar(id).catch(() => {});
+      }
     }
   }
 
@@ -234,6 +302,9 @@ class MailService {
     const messages = this.getStoredMessages();
     const filtered = messages.filter((m) => m.id !== id);
     this.saveMessages(filtered);
+    if (getStoredAuthToken()) {
+      api.deleteMailboxMessage(id).catch(() => {});
+    }
   }
 }
 

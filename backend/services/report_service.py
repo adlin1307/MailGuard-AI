@@ -207,6 +207,17 @@ def generate_scan_report_pdf(scan_data: Dict[str, Any]) -> bytes:
     pdf.set_fill_color(0.58, 0.64, 0.72)
     pdf.draw_text(125, 768, "Automated Bayesian Email Threat & Risk Analysis", font="/F1", size=9)
 
+    # Deduce Scan Source accurately
+    upload_info = scan_data.get("upload_info")
+    if upload_info and isinstance(upload_info, dict):
+        source_label = str(upload_info.get("label") or f"Uploaded File ({upload_info.get('filename')})")
+    elif str(subject).lower().endswith(".eml"):
+        source_label = "Uploaded .EML File"
+    elif str(subject).lower().endswith(".txt"):
+        source_label = "Uploaded .TXT File"
+    else:
+        source_label = "Manual Text Entry"
+
     # Scan Metadata Right-Aligned
     pdf.set_fill_color(0.58, 0.64, 0.72)
     pdf.draw_text(380, 782, "Generated:", font="/F1", size=8.5)
@@ -216,6 +227,10 @@ def generate_scan_report_pdf(scan_data: Dict[str, Any]) -> bytes:
     pdf.draw_text(380, 768, "Report Status:", font="/F1", size=8.5)
     pdf.set_fill_color(0.024, 0.714, 0.831)
     pdf.draw_text(445, 768, "Verified Active", font="/F2", size=8.5)
+    pdf.set_fill_color(0.58, 0.64, 0.72)
+    pdf.draw_text(380, 754, "Scan Source:", font="/F1", size=8.5)
+    pdf.set_fill_color(1.0, 1.0, 1.0)
+    pdf.draw_text(445, 754, escape_pdf_text(source_label)[:24], font="/F2", size=8.5)
 
     current_y = 705
 
@@ -333,10 +348,11 @@ def generate_scan_report_pdf(scan_data: Dict[str, Any]) -> bytes:
     pdf.draw_text(40, current_y, "EMAIL CONTENT INSPECTION", font="/F2", size=10)
     current_y -= 8
 
-    # Box container (capped to max 2 lines each to avoid overflow)
-    subj_lines = wrap_text(f"Subject: {subject}", max_chars=82)[:2]
-    sum_lines = wrap_text(f"Summary: {verdict_summary}", max_chars=82)[:3]
-    box_lines_count = len(subj_lines) + len(sum_lines)
+    # Box container (capped lines to avoid overflow)
+    src_lines = wrap_text(f"Scan Source: {source_label}", max_chars=82)[:1]
+    subj_lines = wrap_text(f"Subject / Name: {subject}", max_chars=82)[:2]
+    sum_lines = wrap_text(f"Summary: {verdict_summary}", max_chars=82)[:2]
+    box_lines_count = len(src_lines) + len(subj_lines) + len(sum_lines)
     box_h = 24 + (box_lines_count * 13)
 
     pdf.set_fill_color(0.97, 0.98, 0.99)
@@ -344,6 +360,11 @@ def generate_scan_report_pdf(scan_data: Dict[str, Any]) -> bytes:
     pdf.draw_rect(40, current_y - box_h, table_w, box_h, fill=True, stroke=True)
 
     text_y = current_y - 16
+    for sr_line in src_lines:
+        pdf.set_fill_color(0.024, 0.50, 0.65)
+        pdf.draw_text(52, text_y, sr_line, font="/F2", size=8.5)
+        text_y -= 13
+
     for s_line in subj_lines:
         pdf.set_fill_color(0.10, 0.14, 0.20)
         pdf.draw_text(52, text_y, s_line, font="/F2", size=8.5)

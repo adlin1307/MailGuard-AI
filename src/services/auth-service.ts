@@ -1,3 +1,5 @@
+import { api, getStoredAuthToken } from './api';
+
 export interface User {
   id: string;
   name: string;
@@ -286,6 +288,7 @@ class AuthService {
   public logout(): void {
     try {
       localStorage.removeItem(SESSION_STORAGE_KEY);
+      api.clearAuthSession();
     } catch (e) {
       console.error('Failed to clear session', e);
     }
@@ -295,7 +298,18 @@ class AuthService {
     try {
       const session = localStorage.getItem(SESSION_STORAGE_KEY);
       if (!session) return null;
-      return JSON.parse(session);
+      const user: User = JSON.parse(session);
+      // Ensure backend session token is synchronized if missing
+      if (!getStoredAuthToken() && user.id && user.email) {
+        const account = this.getStoredUsers().find((u) => u.email.toLowerCase() === user.email.toLowerCase());
+        api.createAuthSession(user.id, user.email, account ? {
+          passwordHash: account.passwordHash,
+          salt: account.salt,
+          name: account.name,
+          role: account.role,
+        } : undefined).catch(() => {});
+      }
+      return user;
     } catch {
       return null;
     }
@@ -304,6 +318,15 @@ class AuthService {
   private setSession(user: User): void {
     try {
       localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(user));
+      const account = this.getStoredUsers().find((u) => u.email.toLowerCase() === user.email.toLowerCase());
+      api.createAuthSession(user.id, user.email, account ? {
+        passwordHash: account.passwordHash,
+        salt: account.salt,
+        name: account.name,
+        role: account.role,
+      } : undefined).catch((err) => {
+        console.warn('Note: Backend auth session token sync:', err?.message);
+      });
     } catch (e) {
       console.error('Failed to set session', e);
     }

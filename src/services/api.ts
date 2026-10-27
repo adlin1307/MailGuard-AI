@@ -8,94 +8,167 @@ import {
   PredictionResult,
   PredictionRecord,
 } from '../types';
-import { mlEngine } from './ml-engine';
-import { generateScanReportPdf, triggerFileDownload } from './pdf-generator';
 
-export { triggerFileDownload };
+const API_BASE = '/api';
+
+async function handleResponse<T>(res: Response): Promise<T> {
+  if (!res.ok) {
+    let errMessage = `Request failed with status ${res.status}`;
+    try {
+      const errData = await res.json();
+      if (errData.error) errMessage = errData.error;
+      else if (errData.message) errMessage = errData.message;
+    } catch {
+      // fallback to status text
+    }
+    throw new Error(errMessage);
+  }
+  return res.json();
+}
+
+const TOKEN_KEY = 'probmail_backend_token_v1';
+
+export function getStoredAuthToken(): string | null {
+  try {
+    return localStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setStoredAuthToken(token: string | null): void {
+  try {
+    if (token) {
+      localStorage.setItem(TOKEN_KEY, token);
+    } else {
+      localStorage.removeItem(TOKEN_KEY);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const token = getStoredAuthToken();
+  const headers = new Headers(init?.headers || {});
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...init,
+      headers,
+    });
+  } catch (err: any) {
+    throw new Error(`Failed to connect to backend server (${url}): ${err.message || 'Network error'}. Please ensure the backend is running.`);
+  }
+  return handleResponse<T>(res);
+}
 
 export const api = {
+  // Auth Session Sync
+  async createAuthSession(
+    userId: string,
+    email: string,
+    credentials?: {
+      passwordHash?: string;
+      salt?: string;
+      name?: string;
+      role?: string;
+    }
+  ): Promise<{ token: string; user: any }> {
+    const res = await requestJson<{ status: string; token: string; user: any }>(`${API_BASE}/auth/session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        user_id: userId,
+        email,
+        password_hash: credentials?.passwordHash,
+        salt: credentials?.salt,
+        name: credentials?.name,
+        role: credentials?.role,
+      }),
+    });
+    setStoredAuthToken(res.token);
+    return res;
+  },
+
+  clearAuthSession(): void {
+    setStoredAuthToken(null);
+  },
+
+  // Shared Backend Mailbox (Authenticated Cross-Browser Persistence)
+  async sendMailboxMessage(payload: {
+    recipient_email: string;
+    recipient_name?: string;
+    subject: string;
+    body: string;
+  }): Promise<{ status: string; message: string; mail: any }> {
+    return requestJson<{ status: string; message: string; mail: any }>(`${API_BASE}/mailbox/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async getInboxMessages(): Promise<{ status: string; count: number; messages: any[] }> {
+    return requestJson<{ status: string; count: number; messages: any[] }>(`${API_BASE}/mailbox/inbox`);
+  },
+
+  async getSpamMessages(): Promise<{ status: string; count: number; messages: any[] }> {
+    return requestJson<{ status: string; count: number; messages: any[] }>(`${API_BASE}/mailbox/spam`);
+  },
+
+  async getSentMessages(): Promise<{ status: string; count: number; messages: any[] }> {
+    return requestJson<{ status: string; count: number; messages: any[] }>(`${API_BASE}/mailbox/sent`);
+  },
+
+  async markMailboxRead(mailId: string): Promise<{ status: string; message: string }> {
+    return requestJson<{ status: string; message: string }>(`${API_BASE}/mailbox/${encodeURIComponent(mailId)}/read`, {
+      method: 'POST',
+    });
+  },
+
+  async toggleMailboxStar(mailId: string): Promise<{ status: string; message: string }> {
+    return requestJson<{ status: string; message: string }>(`${API_BASE}/mailbox/${encodeURIComponent(mailId)}/star`, {
+      method: 'POST',
+    });
+  },
+
+  async deleteMailboxMessage(mailId: string): Promise<{ status: string; message: string }> {
+    return requestJson<{ status: string; message: string }>(`${API_BASE}/mailbox/${encodeURIComponent(mailId)}`, {
+      method: 'DELETE',
+    });
+  },
+
   // Health
-  async getHealth() {
-    return {
-      status: 'healthy',
-      service: 'probmail-security-engine',
-      model_loaded: true,
-    };
+  async getHealth(): Promise<{ status: string; service: string; model_loaded: boolean }> {
+    return requestJson<{ status: string; service: string; model_loaded: boolean }>(`${API_BASE}/health`);
   },
 
   // Dashboard
   async getDashboard(): Promise<DashboardData> {
-    return mlEngine.getDashboardData();
+    return requestJson<DashboardData>(`${API_BASE}/dashboard`);
   },
 
   // Dataset
   async getDatasetSummary(): Promise<{ is_loaded: boolean; summary?: DatasetSummary }> {
-    return mlEngine.getDatasetSummary();
+    return requestJson<{ is_loaded: boolean; summary?: DatasetSummary }>(`${API_BASE}/dataset/summary`);
   },
 
   async loadSampleDataset(): Promise<{ status: string; message: string; summary: DatasetSummary }> {
-    const res = mlEngine.loadSampleDataset();
-    return {
-      status: 'success',
-      message: 'Sample email dataset successfully loaded into platform.',
-      summary: res.summary,
-    };
+    return requestJson<{ status: string; message: string; summary: DatasetSummary }>(`${API_BASE}/dataset/load-sample`, {
+      method: 'POST',
+    });
   },
 
   async uploadDataset(formData: FormData): Promise<{ status: string; message: string; summary: DatasetSummary }> {
-    const file = formData.get('file') as File | null;
-    if (!file) {
-      throw new Error('No dataset file provided.');
-    }
-    const text = await file.text();
-    const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
-    if (lines.length < 2) {
-      throw new Error('CSV file is empty or missing data rows.');
-    }
-
-    const header = lines[0].split(',').map((h) => h.trim().toLowerCase().replace(/['"]/g, ''));
-    let labelIdx = header.findIndex((h) => h.includes('label') || h.includes('class') || h.includes('target'));
-    let bodyIdx = header.findIndex((h) => h.includes('body') || h.includes('text') || h.includes('content') || h.includes('message'));
-    let subjIdx = header.findIndex((h) => h.includes('subject') || h.includes('title'));
-
-    if (labelIdx === -1) labelIdx = 0;
-    if (bodyIdx === -1) bodyIdx = header.length > 2 ? 2 : 1;
-
-    const parsedRows: { label: 'ham' | 'spam'; subject: string; body: string }[] = [];
-    for (let i = 1; i < lines.length; i++) {
-      const line = lines[i];
-      // Simple CSV regex parse
-      const matches = line.match(/(?:^|,)(?:"([^"]*(?:""[^"]*)*)"|([^",]*))/g);
-      if (!matches) continue;
-      const cols = matches.map((m) => {
-        let val = m.replace(/^,/, '').trim();
-        if (val.startsWith('"') && val.endsWith('"')) {
-          val = val.slice(1, -1).replace(/""/g, '"');
-        }
-        return val;
-      });
-
-      const rawLabel = (cols[labelIdx] || '').toLowerCase().trim();
-      const isSpam = rawLabel === 'spam' || rawLabel === '1' || rawLabel === 'malicious';
-      const label = isSpam ? ('spam' as const) : ('ham' as const);
-      const subj = subjIdx !== -1 && cols[subjIdx] ? cols[subjIdx] : '';
-      const body = cols[bodyIdx] || cols[cols.length - 1] || '';
-
-      if (body.trim().length > 0 || subj.trim().length > 0) {
-        parsedRows.push({ label, subject: subj, body });
-      }
-    }
-
-    if (parsedRows.length === 0) {
-      throw new Error('No valid rows could be extracted from uploaded CSV file.');
-    }
-
-    const summary = mlEngine.uploadDataset(parsedRows);
-    return {
-      status: 'success',
-      message: `Successfully processed and cleaned ${parsedRows.length} email records.`,
-      summary,
-    };
+    return requestJson<{ status: string; message: string; summary: DatasetSummary }>(`${API_BASE}/dataset/upload`, {
+      method: 'POST',
+      body: formData,
+    });
   },
 
   async remapColumns(mappings: {
@@ -103,35 +176,20 @@ export const api = {
     label_column: string;
     subject_column?: string;
   }): Promise<{ status: string; summary: DatasetSummary }> {
-    const res = mlEngine.getDatasetSummary();
-    const updatedSummary = {
-      ...res.summary,
-      selected_columns: {
-        text_column: mappings.text_column,
-        label_column: mappings.label_column,
-        subject_column: mappings.subject_column || null,
-      },
-    };
-    return { status: 'success', summary: updatedSummary };
+    return requestJson<{ status: string; summary: DatasetSummary }>(`${API_BASE}/dataset/remap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(mappings),
+    });
   },
 
   // Analytics
   async getStatistics(): Promise<{ is_available: boolean; filename?: string; statistics: DatasetStatistics }> {
-    const stats = mlEngine.getStatistics();
-    return {
-      is_available: true,
-      filename: 'sample_dataset.csv',
-      statistics: stats,
-    };
+    return requestJson<{ is_available: boolean; filename?: string; statistics: DatasetStatistics }>(`${API_BASE}/analytics/statistics`);
   },
 
   async getChiSquare(k: number = 50): Promise<{ is_available: boolean; filename?: string; analysis: ChiSquareAnalysis }> {
-    const analysis = mlEngine.getChiSquare(k);
-    return {
-      is_available: true,
-      filename: 'sample_dataset.csv',
-      analysis,
-    };
+    return requestJson<{ is_available: boolean; filename?: string; analysis: ChiSquareAnalysis }>(`${API_BASE}/analytics/chi-square?k=${k}`);
   },
 
   // Model Training
@@ -141,78 +199,123 @@ export const api = {
     alpha: number;
     max_features: number;
   }): Promise<{ status: string; message: string }> {
-    return mlEngine.startTraining(params);
+    return requestJson<{ status: string; message: string }>(`${API_BASE}/model/train`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
   },
 
   async getTrainingStatus(): Promise<TrainingStatus> {
-    return mlEngine.getTrainingStatus();
+    return requestJson<TrainingStatus>(`${API_BASE}/model/status`);
   },
 
   async getEvaluation(): Promise<EvaluationData> {
-    return mlEngine.getEvaluationData();
+    return requestJson<EvaluationData>(`${API_BASE}/model/evaluation`);
   },
 
   // Prediction / Scanner
   async predictEmail(payload: { subject?: string; body?: string }): Promise<PredictionResult> {
-    return mlEngine.predictEmail(payload.subject, payload.body);
+    return requestJson<PredictionResult>(`${API_BASE}/predict`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
   },
 
   async predictEmailFile(formData: FormData): Promise<PredictionResult> {
-    const file = formData.get('file') as File | null;
-    if (!file) {
-      throw new Error('No file provided for email analysis.');
-    }
-    const text = await file.text();
-    // Parse possible .eml header
-    let subject = file.name.replace(/\.[^/.]+$/, '');
-    let body = text;
-
-    const subjectMatch = text.match(/^Subject:\s*(.+)$/im);
-    if (subjectMatch) {
-      subject = subjectMatch[1].trim();
-      const bodySplit = text.split(/\r?\n\r?\n/);
-      if (bodySplit.length > 1) {
-        body = bodySplit.slice(1).join('\n\n');
-      }
-    }
-
-    return mlEngine.predictEmail(subject, body);
+    return requestJson<PredictionResult>(`${API_BASE}/predict`, {
+      method: 'POST',
+      body: formData,
+    });
   },
 
   // Prediction History
   async getHistory(): Promise<{ status: string; count: number; statistics: any; predictions: PredictionRecord[] }> {
-    const hist = mlEngine.getHistory();
-    return {
-      status: 'success',
-      count: hist.count,
-      statistics: hist.statistics,
-      predictions: hist.predictions,
-    };
+    return requestJson<{ status: string; count: number; statistics: any; predictions: PredictionRecord[] }>(`${API_BASE}/predictions/history`);
   },
 
   async getPredictionDetail(id: number): Promise<{ status: string; prediction: PredictionRecord }> {
-    const pred = mlEngine.getPredictionById(id);
-    if (!pred) throw new Error(`Scan audit with ID #${id} not found.`);
-    return { status: 'success', prediction: pred };
+    return requestJson<{ status: string; prediction: PredictionRecord }>(`${API_BASE}/predictions/${id}`);
   },
 
   async clearHistory(): Promise<{ status: string; message: string; deleted_count: number }> {
-    const res = mlEngine.clearHistory();
-    return {
-      status: 'success',
-      message: `Cleared ${res.deleted_count} scan audit records.`,
-      deleted_count: res.deleted_count,
-    };
+    return requestJson<{ status: string; message: string; deleted_count: number }>(`${API_BASE}/predictions/history`, {
+      method: 'DELETE',
+    });
   },
 
   // PDF Reports
   async downloadScanReport(payload: Record<string, any>): Promise<Blob> {
-    return generateScanReportPdf(payload);
+    const token = getStoredAuthToken();
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}/predict/report`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+      });
+    } catch (err: any) {
+      throw new Error(`Failed to connect to backend server: ${err.message || 'Network error'}`);
+    }
+    if (!res.ok) {
+      let errMessage = `Failed to generate PDF report (status ${res.status})`;
+      try {
+        const errData = await res.json();
+        if (errData.error) errMessage = errData.error;
+      } catch {
+        // fallback
+      }
+      throw new Error(errMessage);
+    }
+    return res.blob();
   },
 
   async downloadScanReportById(id: number): Promise<Blob> {
-    const pred = mlEngine.getPredictionById(id);
-    if (!pred) throw new Error(`Scan audit with ID #${id} not found.`);
-    return generateScanReportPdf(pred);
+    const token = getStoredAuthToken();
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}/predict/report/${id}`, { headers });
+    } catch (err: any) {
+      throw new Error(`Failed to connect to backend server: ${err.message || 'Network error'}`);
+    }
+    if (!res.ok) {
+      let errMessage = `Failed to generate PDF report (status ${res.status})`;
+      try {
+        const errData = await res.json();
+        if (errData.error) errMessage = errData.error;
+      } catch {
+        // fallback
+      }
+      throw new Error(errMessage);
+    }
+    return res.blob();
   },
 };
+
+export function triggerFileDownload(blob: Blob, filename: string) {
+  const pdfBlob = blob.type === 'application/pdf' ? blob : new Blob([blob], { type: 'application/pdf' });
+  const url = window.URL.createObjectURL(pdfBlob);
+  const a = document.createElement('a');
+  a.style.display = 'none';
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    try {
+      if (document.body.contains(a)) {
+        document.body.removeChild(a);
+      }
+      window.URL.revokeObjectURL(url);
+    } catch {
+      // ignore
+    }
+  }, 2000);
+}

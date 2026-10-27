@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from ml.predict import predict_email
 from services.db import save_prediction, get_prediction_by_id, get_recent_predictions
 from services.report_service import generate_scan_report_pdf
+from services.auth_helper import get_authenticated_user
 
 predict_bp = Blueprint("predict", __name__)
 
@@ -12,20 +13,47 @@ predict_bp = Blueprint("predict", __name__)
 def scan_email():
     """
     Scans an email (subject + body or uploaded text file) using the trained pipeline.
-    Saves an audit record to SQLite with estimated spam and ham probabilities and
+    Saves an audit record to SQLite with estimated spam and ham probabilities,
+    attributed to the authenticated user if logged in, and
     returns probabilistic verdict, influential words, risk score, and explanation.
     """
     subject = None
     body = None
 
-    # Support multipart file upload (e.g. email.txt)
+    # Support multipart file upload (e.g. email.txt, alert.eml)
+    upload_info = None
     if "file" in request.files:
         file = request.files["file"]
         if file and file.filename != "":
+            filename = file.filename
+            file_ext = "eml" if filename.lower().endswith(".eml") else "txt" if filename.lower().endswith(".txt") else "file"
             try:
-                content = file.read().decode("utf-8", errors="replace")
-                subject = file.filename
-                body = content
+                raw_bytes = file.read()
+                content = raw_bytes.decode("utf-8", errors="replace")
+                subject = filename  # Retain original uploaded filename as subject
+                
+                if file_ext == "eml":
+                    try:
+                        import email
+                        from email import policy
+                        msg = email.message_from_bytes(raw_bytes, policy=policy.default)
+                        body_part = msg.get_body(preferencelist=("plain", "html"))
+                        if body_part:
+                            extracted = body_part.get_content()
+                            body = extracted if isinstance(extracted, str) and extracted.strip() else content
+                        else:
+                            payload = msg.get_payload()
+                            body = payload if isinstance(payload, str) and payload.strip() else content
+                    except Exception:
+                        body = content
+                else:
+                    body = content
+
+                upload_info = {
+                    "filename": filename,
+                    "file_type": file_ext,
+                    "label": f"Uploaded {file_ext.upper()} File"
+                }
             except Exception as e:
                 return jsonify({"error": f"Failed to read email file: {str(e)}"}), 400
 
@@ -50,8 +78,14 @@ def scan_email():
     if result.get("status") != "success":
         return jsonify(result), 400
 
-    # Save to SQLite prediction history
+    if upload_info:
+        result["upload_info"] = upload_info
+
+    # Save to SQLite prediction history, scoping to authenticated owner if present
     try:
+        user = get_authenticated_user()
+        owner_id = user["user_id"] if user else None
+
         snippet_text = body_clean if body_clean else subj_clean
         snippet = snippet_text[:120]
         rec_id = save_prediction(
@@ -61,9 +95,12 @@ def scan_email():
             confidence=result["confidence_percentage"],
             spam_prob=result.get("spam_probability"),
             ham_prob=result.get("ham_probability"),
-            risk_score=result.get("risk_score")
+            risk_score=result.get("risk_score"),
+            owner_id=owner_id
         )
         result["prediction_id"] = rec_id
+        if owner_id:
+            result["owner_id"] = owner_id
     except Exception as e:
         print(f"Warning: Failed to save prediction to DB: {e}")
 
@@ -86,6 +123,11 @@ def download_scan_report():
         if pred_id and str(pred_id).isdigit():
             rec = get_prediction_by_id(int(pred_id))
             if rec:
+                rec_owner = rec.get("owner_id")
+                if rec_owner:
+                    user = get_authenticated_user()
+                    if not user or user["user_id"] != rec_owner:
+                        return jsonify({"error": "Forbidden: You are not authorized to download this scan report."}), 403
                 data = rec
         if not data and request.args:
             data = request.args.to_dict()
@@ -118,10 +160,17 @@ def download_scan_report():
 def download_scan_report_by_id(prediction_id: int):
     """
     Generates and downloads a scan report for an existing prediction record in the SQLite database.
+    Enforces authorization: users cannot download another user's owned scan report.
     """
     record = get_prediction_by_id(prediction_id)
     if not record:
         return jsonify({"error": f"Scan record #{prediction_id} not found."}), 404
+
+    record_owner = record.get("owner_id")
+    if record_owner:
+        user = get_authenticated_user()
+        if not user or user["user_id"] != record_owner:
+            return jsonify({"error": "Forbidden: You are not authorized to download this scan report."}), 403
 
     try:
         pdf_bytes = generate_scan_report_pdf(record)

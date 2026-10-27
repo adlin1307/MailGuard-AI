@@ -117,6 +117,11 @@ export interface PredictionResult {
   subject_snippet: string;
   cleaned_length: number;
   prediction_id?: number;
+  upload_info?: {
+    filename: string;
+    file_type: string;
+    label: string;
+  };
   error?: string;
 }
 

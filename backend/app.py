@@ -23,6 +23,8 @@ from routes.analytics import analytics_bp
 from routes.model import model_bp
 from routes.predict import predict_bp
 from routes.predictions import predictions_bp
+from routes.auth import auth_bp
+from routes.mailbox import mailbox_bp
 
 
 def create_app() -> Flask:
@@ -52,6 +54,8 @@ def create_app() -> Flask:
     app.register_blueprint(model_bp, url_prefix="/api")
     app.register_blueprint(predict_bp, url_prefix="/api")
     app.register_blueprint(predictions_bp, url_prefix="/api")
+    app.register_blueprint(auth_bp, url_prefix="/api")
+    app.register_blueprint(mailbox_bp, url_prefix="/api")
 
     # Serve built frontend assets if present
     if frontend_dist.exists():

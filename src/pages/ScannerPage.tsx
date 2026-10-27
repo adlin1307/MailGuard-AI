@@ -235,13 +235,42 @@ export const ScannerPage: React.FC = () => {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const handleSubjectChange = (val: string) => {
+    setSubject(val);
+    if (file) {
+      setFile(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+    if (result) setResult(null);
+  };
+
+  const handleBodyChange = (val: string) => {
+    setBody(val);
+    if (file) {
+      setFile(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+    if (result) setResult(null);
+  };
+
+  const isEmlFile = Boolean(file && file.name.toLowerCase().endsWith('.eml'));
+  const isTxtFile = Boolean(file && file.name.toLowerCase().endsWith('.txt'));
+
+  const scanButtonLabel = file
+    ? (isEmlFile ? 'Analyze Email File' : isTxtFile ? 'Analyze Text File' : 'Analyze File')
+    : 'Analyze Text';
+
+  const scanLoadingLabel = file
+    ? (isEmlFile ? 'Analyzing Email File...' : isTxtFile ? 'Analyzing Text File...' : 'Analyzing File...')
+    : 'Analyzing Text...';
+
   return (
     <div className="space-y-6">
       {/* Page Header */}
       <div>
-        <h1 className="text-2xl font-bold tracking-tight text-white">Email Scanner</h1>
+        <h1 className="text-2xl font-bold tracking-tight text-white">Email &amp; File Scanner</h1>
         <p className="text-sm text-slate-400 mt-1">
-          Enter an email subject and message to check whether it is legitimate (Ham) or suspicious (Spam).
+          Enter text or upload an email file (.eml, .txt) to check whether it is legitimate (Ham) or suspicious (Spam).
         </p>
       </div>
 
@@ -284,12 +313,12 @@ export const ScannerPage: React.FC = () => {
           <form onSubmit={handleSubmit} className="p-5 rounded-2xl bg-slate-900/80 border border-slate-800 space-y-4 shadow-md">
             <div>
               <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                Email Subject
+                Email Subject / File Name
               </label>
               <input
                 type="text"
                 value={subject}
-                onChange={(e) => setSubject(e.target.value)}
+                onChange={(e) => handleSubjectChange(e.target.value)}
                 placeholder="e.g. Action Required: Please verify your account..."
                 className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500 transition font-sans"
               />
@@ -307,7 +336,7 @@ export const ScannerPage: React.FC = () => {
               <textarea
                 rows={9}
                 value={body}
-                onChange={(e) => setBody(e.target.value)}
+                onChange={(e) => handleBodyChange(e.target.value)}
                 placeholder="Paste the email content or message body here..."
                 className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-500 transition font-sans leading-relaxed"
               />
@@ -353,12 +382,12 @@ export const ScannerPage: React.FC = () => {
                 {loading ? (
                   <>
                     <RefreshCw className="w-4 h-4 animate-spin" />
-                    <span>Analyzing Email...</span>
+                    <span>{scanLoadingLabel}</span>
                   </>
                 ) : (
                   <>
                     <MailSearch className="w-4 h-4" />
-                    <span>Analyze Email</span>
+                    <span>{scanButtonLabel}</span>
                   </>
                 )}
               </button>
@@ -380,10 +409,24 @@ export const ScannerPage: React.FC = () => {
           {result ? (
             <div className="p-6 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-5 shadow-xl animate-in fade-in duration-200">
               {/* Verdict Header Badge */}
-              <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-                <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-                  Scan Analysis Results
-                </span>
+              <div className="flex flex-wrap items-center justify-between pb-3 border-b border-slate-800 gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+                    Scan Analysis Results
+                  </span>
+                  {(result.upload_info || file) ? (
+                    <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-cyan-950/80 text-cyan-300 border border-cyan-700/80">
+                      <FileText className="w-3 h-3 text-cyan-400" />
+                      <span>
+                        {result.upload_info?.label || (file?.name.toLowerCase().endsWith('.eml') ? 'Uploaded .EML File' : 'Uploaded .TXT File')}: {result.upload_info?.filename || file?.name}
+                      </span>
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono bg-slate-800/80 text-slate-400 border border-slate-700">
+                      Manual Text Entry
+                    </span>
+                  )}
+                </div>
                 <button
                   onClick={copyVerdict}
                   className="text-xs text-slate-400 hover:text-white flex items-center space-x-1 transition"
@@ -428,6 +471,14 @@ export const ScannerPage: React.FC = () => {
                 </div>
               </div>
 
+              {/* Statistical Notice */}
+              <div className="text-[11px] text-slate-400 bg-slate-950/60 p-2.5 rounded-xl border border-slate-800/80 flex items-start space-x-2">
+                <Shield className="w-3.5 h-3.5 text-cyan-400 mt-0.5 shrink-0" />
+                <span>
+                  <strong className="text-slate-300">Statistical Notice:</strong> Predictions are probabilistic estimates based on Bayesian modeling; a Ham classification indicates low estimated risk, not a guarantee of safety.
+                </span>
+              </div>
+
               {/* 2. Email Risk Score (0-100) */}
               <div className="p-4 rounded-xl bg-slate-950/80 border border-slate-800 space-y-3">
                 <div className="flex items-center justify-between">
@@ -466,7 +517,7 @@ export const ScannerPage: React.FC = () => {
                       </div>
                     </div>
                     <p className="text-[11px] text-slate-500 leading-tight pt-1">
-                      Score is derived from the model's estimated Spam probability ({spamProb}%). It is a statistical estimate, not a guarantee of safety.
+                      Score reflects the model's posterior Spam probability ({spamProb}%).
                     </p>
                   </div>
                 </div>

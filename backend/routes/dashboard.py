@@ -2,6 +2,7 @@ from flask import Blueprint, jsonify
 from services.db import get_prediction_statistics, get_recent_predictions
 from services.dataset_service import dataset_service
 from ml.train import load_trained_pipeline
+from services.auth_helper import get_authenticated_user
 
 dashboard_bp = Blueprint("dashboard", __name__)
 
@@ -11,7 +12,7 @@ def get_dashboard_data():
     """
     Returns authentic dashboard statistics aggregated from the real preloaded dataset,
     SQLite scan history, and genuine model evaluation metrics.
-    No hardcoded sample numbers.
+    When authenticated, scopes metrics and recent scans strictly to the current user.
     """
     # 1. Dataset information from active loaded dataset
     dataset_summary = dataset_service.get_summary()
@@ -50,9 +51,11 @@ def get_dashboard_data():
             "class_distribution": {}
         }
 
-    # 2. Real scan statistics from SQLite
-    scan_stats = get_prediction_statistics()
-    recent_scans = get_recent_predictions(limit=10)
+    # 2. Real scan statistics from SQLite (scoped to authenticated user if present)
+    user = get_authenticated_user()
+    owner_id = user["user_id"] if user else None
+    scan_stats = get_prediction_statistics(owner_id=owner_id)
+    recent_scans = get_recent_predictions(limit=10, owner_id=owner_id)
 
     # 3. Genuine model evaluation and hyperparameters
     pipeline, metadata = load_trained_pipeline()

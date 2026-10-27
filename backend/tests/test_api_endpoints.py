@@ -1,5 +1,6 @@
 import pytest
 import json
+import io
 from app import create_app
 from services.db import clear_prediction_history
 from services.dataset_service import dataset_service
@@ -136,3 +137,52 @@ def test_invalid_predict_input(client):
     )
     assert res.status_code == 400
     assert "error" in res.get_json()
+
+
+def test_predict_txt_file_upload(client):
+    data = {
+        "file": (io.BytesIO(b"Urgent account security alert: verify password immediately"), "security_alert.txt")
+    }
+    res = client.post("/api/predict", data=data, content_type="multipart/form-data")
+    assert res.status_code == 200
+    result = res.get_json()
+    assert result["status"] == "success"
+    assert "predicted_class" in result
+    assert "upload_info" in result
+    assert result["upload_info"]["filename"] == "security_alert.txt"
+    assert result["upload_info"]["file_type"] == "txt"
+
+    # Verify history retains the original filename
+    hist_res = client.get("/api/predictions/history")
+    assert hist_res.status_code == 200
+    predictions = hist_res.get_json()["predictions"]
+    assert any(p["subject"] == "security_alert.txt" for p in predictions)
+
+
+def test_predict_eml_file_upload(client):
+    eml_content = (
+        b"From: billing@phish-domain.com\r\n"
+        b"To: victim@example.org\r\n"
+        b"Subject: Overdue Invoice\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"\r\n"
+        b"Dear user, you have won $1,000,000 lottery cash prize! Click here immediately to claim.\r\n"
+    )
+    data = {
+        "file": (io.BytesIO(eml_content), "invoice_1092.eml")
+    }
+    res = client.post("/api/predict", data=data, content_type="multipart/form-data")
+    assert res.status_code == 200
+    result = res.get_json()
+    assert result["status"] == "success"
+    assert "predicted_class" in result
+    assert "upload_info" in result
+    assert result["upload_info"]["filename"] == "invoice_1092.eml"
+    assert result["upload_info"]["file_type"] == "eml"
+
+    # Verify history retains the .eml filename
+    hist_res = client.get("/api/predictions/history")
+    assert hist_res.status_code == 200
+    predictions = hist_res.get_json()["predictions"]
+    assert any(p["subject"] == "invoice_1092.eml" for p in predictions)
+

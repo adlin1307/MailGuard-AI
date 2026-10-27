@@ -1,0 +1,2 @@
+case_id,title,category,status,priority,created_at,description
+CASE-ROB-001,Central Jewellery Robbery,ROBBERY,ACTIVE,HIGH,2026-09-01T09:00:00+00:00,Synthetic robbery investigation created for VERIFAI SIH demonstration.

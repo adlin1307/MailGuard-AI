@@ -4,7 +4,6 @@ import { InboxPage } from './pages/InboxPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { ScannerPage } from './pages/ScannerPage';
 import { HistoryPage } from './pages/HistoryPage';
-import { DatasetPage } from './pages/DatasetPage';
 import { Header } from './components/Header';
 import { Sidebar, PageId } from './components/Sidebar';
 import { authService, User } from './services/auth-service';
@@ -39,8 +38,6 @@ export const App: React.FC = () => {
         return <ScannerPage />;
       case 'history':
         return <HistoryPage />;
-      case 'dataset':
-        return <DatasetPage />;
       default:
         return <InboxPage currentUser={currentUser} onLogout={handleLogout} />;
     }

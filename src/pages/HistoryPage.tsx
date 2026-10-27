@@ -213,8 +213,13 @@ export const HistoryPage: React.FC = () => {
                     <tr key={pred.id} className="hover:bg-slate-800/40 transition">
                       <td className="py-2.5 px-3 text-slate-500">#{pred.id}</td>
                       <td className="py-2.5 px-3">
-                        <div className="font-semibold text-white truncate max-w-xs sm:max-w-md font-sans">
-                          {pred.subject || 'Untitled Email'}
+                        <div className="font-semibold text-white truncate max-w-xs sm:max-w-md font-sans flex items-center space-x-1.5">
+                          {pred.subject && (pred.subject.toLowerCase().endsWith('.eml') || pred.subject.toLowerCase().endsWith('.txt')) && (
+                            <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-cyan-950/80 text-cyan-300 border border-cyan-800 shrink-0">
+                              {pred.subject.toLowerCase().endsWith('.eml') ? '.EML' : '.TXT'}
+                            </span>
+                          )}
+                          <span className="truncate">{pred.subject || 'Untitled Email'}</span>
                         </div>
                         {pred.snippet && (
                           <div className="text-[11px] text-slate-400 truncate max-w-xs sm:max-w-md font-sans mt-0.5">
@@ -315,10 +320,15 @@ export const HistoryPage: React.FC = () => {
 
             <div className="p-5 space-y-4">
               <div>
-                <span className="text-xs text-slate-400 uppercase font-mono block mb-1">Subject</span>
-                <p className="text-sm font-semibold text-white bg-slate-950 p-3 rounded-lg border border-slate-800">
-                  {selectedRecord.subject || 'Untitled Email'}
-                </p>
+                <span className="text-xs text-slate-400 uppercase font-mono block mb-1">Subject / Source</span>
+                <div className="text-sm font-semibold text-white bg-slate-950 p-3 rounded-lg border border-slate-800 flex items-center space-x-2">
+                  {selectedRecord.subject && (selectedRecord.subject.toLowerCase().endsWith('.eml') || selectedRecord.subject.toLowerCase().endsWith('.txt')) && (
+                    <span className="px-2 py-0.5 rounded text-[11px] font-mono bg-cyan-950/80 text-cyan-300 border border-cyan-800 shrink-0">
+                      {selectedRecord.subject.toLowerCase().endsWith('.eml') ? 'Uploaded .EML File' : 'Uploaded .TXT File'}
+                    </span>
+                  )}
+                  <span className="truncate">{selectedRecord.subject || 'Untitled Email'}</span>
+                </div>
               </div>
 
               <div>

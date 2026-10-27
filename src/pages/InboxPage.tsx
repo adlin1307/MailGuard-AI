@@ -25,6 +25,7 @@ import { mailService, MailItem } from '../services/mail-service';
 import { User, authService } from '../services/auth-service';
 import { mlEngine } from '../services/ml-engine';
 import { generateScanReportPdf, triggerFileDownload } from '../services/pdf-generator';
+import { PredictionResult } from '../types';
 
 interface InboxPageProps {
   currentUser: User;
@@ -50,15 +51,24 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
   const [composeError, setComposeError] = useState<string | null>(null);
   const [composeSuccess, setComposeSuccess] = useState<string | null>(null);
 
+  // Debounced live pre-flight classification preview state
+  const [livePreview, setLivePreview] = useState<PredictionResult | null>(null);
+  const [isCheckingPreview, setIsCheckingPreview] = useState(false);
+
   // Other registered users in the system for quick recipient selection
   const [registeredUsers, setRegisteredUsers] = useState<
     { id: string; name: string; email: string; role: string }[]
   >([]);
 
   // Load emails
-  const loadMails = () => {
+  const loadMails = async () => {
     setIsRefreshing(true);
-    mailService.ensureSeedForUser(currentUser);
+
+    try {
+      await mailService.syncWithBackend();
+    } catch {
+      // fallback to local storage
+    }
 
     let list: MailItem[] = [];
     if (currentFolder === 'inbox') {
@@ -155,6 +165,8 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
     setComposeBody('');
     setComposeError(null);
     setComposeSuccess(null);
+    setLivePreview(null);
+    setIsCheckingPreview(false);
     setShowCompose(true);
   };
 
@@ -186,7 +198,7 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
       });
 
       setComposeSuccess(
-        `Email sent successfully! AI Classified as: ${sent.predictedClass.toUpperCase()} (${sent.confidence.toFixed(1)}% confidence)`
+        `Message sent to in-app recipient (${composeTo.trim()}). Stored in Sent mail.`
       );
       setTimeout(() => {
         setShowCompose(false);
@@ -199,11 +211,41 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
     }
   };
 
-  // Live pre-flight classification preview in compose modal
-  const livePreview =
-    composeSubject.trim() || composeBody.trim()
-      ? mlEngine.predictEmail(composeSubject, composeBody)
-      : null;
+  // Debounced pre-flight classification preview (decoupled from render body)
+  useEffect(() => {
+    // If compose modal is closed or inputs are empty, clear preview and do nothing
+    if (!showCompose || (!composeSubject.trim() && !composeBody.trim())) {
+      setLivePreview(null);
+      setIsCheckingPreview(false);
+      return;
+    }
+
+    setIsCheckingPreview(true);
+    let isCancelled = false;
+
+    // 350ms debounce window to prevent prediction execution on every keystroke
+    const timer = setTimeout(() => {
+      if (isCancelled) return;
+      try {
+        // Non-persisting pre-flight check (recordHistory = false) to protect scan history
+        const result = mlEngine.predictEmail(composeSubject, composeBody, false);
+        if (!isCancelled) {
+          setLivePreview(result);
+          setIsCheckingPreview(false);
+        }
+      } catch {
+        if (!isCancelled) {
+          setIsCheckingPreview(false);
+        }
+      }
+    }, 350);
+
+    // Cancel timer and mark request stale on input change, modal close, or unmount
+    return () => {
+      isCancelled = true;
+      clearTimeout(timer);
+    };
+  }, [showCompose, composeSubject, composeBody]);
 
   // Filter mails
   const filteredMails = mails.filter((m) => {
@@ -794,6 +836,12 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
               </div>
 
               {/* Live Bayesian Pre-Flight Preview */}
+              {isCheckingPreview && !livePreview && (
+                <div className="p-2.5 rounded-xl border border-slate-800 bg-slate-950/60 flex items-center space-x-2 text-xs font-mono text-slate-400">
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin text-cyan-400" />
+                  <span>Checking message with AI classifier...</span>
+                </div>
+              )}
               {livePreview && (
                 <div
                   className={`p-3 rounded-xl border flex items-center justify-between text-xs font-mono ${
@@ -812,6 +860,9 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
                       AI Classifier Pre-Check:{' '}
                       <strong className="uppercase">{livePreview.predicted_class}</strong>
                     </span>
+                    {isCheckingPreview && (
+                      <RefreshCw className="w-3 h-3 animate-spin text-slate-400 ml-1.5 inline" />
+                    )}
                   </div>
                   <span>
                     Spam Probability:{' '}

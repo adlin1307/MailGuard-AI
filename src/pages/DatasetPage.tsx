@@ -124,7 +124,7 @@ export const DatasetPage: React.FC = () => {
             </span>
           </div>
           <p className="text-sm text-slate-400 mt-1">
-            CSV dataset ingestion, column mapping, HTML entity decoding, tokenization, and label normalization.
+            CSV dataset ingestion, column mapping, HTML entity decoding, tokenization, and label normalization. Loading a dataset prepares and validates data hygiene statistics; model retraining is an explicit action.
           </p>
         </div>
 
@@ -132,6 +132,7 @@ export const DatasetPage: React.FC = () => {
           <button
             onClick={handleLoadBenchmark}
             disabled={loading}
+            title="Preprocesses and inspects benchmark CSV dataset without modifying saved model weights."
             className="px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-semibold flex items-center space-x-2 transition"
           >
             <Sparkles className="w-4 h-4 text-cyan-400" />

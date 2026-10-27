@@ -113,7 +113,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({ onNavigate }) => {
               className="px-4 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 flex items-center space-x-2 transition"
             >
               <ArrowRight className="w-4 h-4 text-cyan-400" />
-              <span>Email Scanner</span>
+              <span>Email &amp; File Scanner</span>
             </button>
             <button
               onClick={() => onNavigate('history')}
@@ -176,9 +176,9 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({ onNavigate }) => {
             <div className="w-8 h-8 rounded-lg bg-cyan-950/80 border border-cyan-800/80 flex items-center justify-center text-cyan-400 text-xs font-bold font-mono">
               1
             </div>
-            <h3 className="text-sm font-semibold text-white">Enter Email</h3>
+            <h3 className="text-sm font-semibold text-white">Enter Email or File</h3>
             <p className="text-xs text-slate-400 leading-relaxed font-sans">
-              Enter the subject line and paste the email body message or upload an .eml file into the scanner.
+              Enter the subject line and paste the message text, or upload an email file (.eml, .txt) into the scanner.
             </p>
           </div>
 
@@ -238,8 +238,13 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({ onNavigate }) => {
                 {recentPredictions.map((pred) => (
                   <tr key={pred.id} className="hover:bg-slate-800/40 transition">
                     <td className="py-2.5 px-3">
-                      <div className="font-semibold text-slate-200 truncate max-w-xs sm:max-w-md font-sans">
-                        {pred.subject || 'Untitled Email'}
+                      <div className="font-semibold text-slate-200 truncate max-w-xs sm:max-w-md font-sans flex items-center space-x-1.5">
+                        {pred.subject && (pred.subject.toLowerCase().endsWith('.eml') || pred.subject.toLowerCase().endsWith('.txt')) && (
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-cyan-950/80 text-cyan-300 border border-cyan-800 shrink-0">
+                            {pred.subject.toLowerCase().endsWith('.eml') ? '.EML' : '.TXT'}
+                          </span>
+                        )}
+                        <span className="truncate">{pred.subject || 'Untitled Email'}</span>
                       </div>
                       {pred.snippet && (
                         <div className="text-[11px] text-slate-500 truncate max-w-xs sm:max-w-md font-sans">
@@ -265,7 +270,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({ onNavigate }) => {
                       {pred.ham_probability !== undefined ? `${pred.ham_probability.toFixed(1)}%` : `${(100 - pred.confidence).toFixed(1)}%`}
                     </td>
                     <td className="py-2.5 px-3 text-right text-slate-500">
-                      {new Date(pred.timestamp).toLocaleString()}
+                      {!isNaN(new Date(pred.timestamp).getTime()) ? new Date(pred.timestamp).toLocaleString() : pred.timestamp}
                     </td>
                   </tr>
                 ))}

@@ -3,7 +3,6 @@ import {
   LayoutDashboard,
   MailSearch,
   History,
-  Database,
   ShieldCheck,
   LogOut,
   User as UserIcon,
@@ -14,8 +13,7 @@ export type PageId =
   | 'inbox'
   | 'dashboard'
   | 'scanner'
-  | 'history'
-  | 'dataset';
+  | 'history';
 
 interface SidebarProps {
   currentPage: PageId;
@@ -44,7 +42,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     },
     {
       id: 'scanner',
-      label: 'Email Scanner',
+      label: 'Email & File Scanner',
       icon: <MailSearch className="w-4 h-4" />,
       badge: 'Scan',
     },
@@ -52,14 +50,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
       id: 'history',
       label: 'Scan History',
       icon: <History className="w-4 h-4" />,
-    },
-  ];
-
-  const mlAnalyticsItems: { id: PageId; label: string; icon: React.ReactNode; badge?: string }[] = [
-    {
-      id: 'dataset',
-      label: 'Dataset Management',
-      icon: <Database className="w-4 h-4" />,
     },
   ];
 
@@ -73,38 +63,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
           <nav className="space-y-1">
             {securityItems.map((item) => (
-              <button
-                key={item.id}
-                onClick={() => onSelectPage(item.id)}
-                className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs font-medium transition ${
-                  currentPage === item.id
-                    ? 'bg-cyan-950/80 text-cyan-300 border border-cyan-800 shadow-sm shadow-cyan-950'
-                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
-                }`}
-              >
-                <div className="flex items-center space-x-2.5">
-                  <span className={currentPage === item.id ? 'text-cyan-400' : 'text-slate-400'}>
-                    {item.icon}
-                  </span>
-                  <span>{item.label}</span>
-                </div>
-                {item.badge && (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded font-mono font-medium bg-cyan-900/60 text-cyan-300 border border-cyan-700/50">
-                    {item.badge}
-                  </span>
-                )}
-              </button>
-            ))}
-          </nav>
-        </div>
-
-        {/* Machine Learning & Analytics */}
-        <div>
-          <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 px-3 mb-2 font-mono">
-            ML &amp; Analytics
-          </div>
-          <nav className="space-y-1">
-            {mlAnalyticsItems.map((item) => (
               <button
                 key={item.id}
                 onClick={() => onSelectPage(item.id)}

@@ -151,85 +151,39 @@ class ProbMailEngine {
       this.activeDataset = [...SAMPLE_EMAILS];
     }
 
-    // Initialize initial scan history if empty
-    const savedHistory = localStorage.getItem('probmail_predictions');
-    if (!savedHistory) {
-      this.seedInitialHistory();
-    }
+    // Clean up any legacy seeded demonstration records safely if present
+    this.cleanLegacyDemoHistory();
 
     // Automatically train initial model
     this.trainModelSync(50, 0.2, 1.0, 1500);
   }
 
-  private seedInitialHistory() {
-    const initialRecords: PredictionRecord[] = [
-      {
-        id: 1,
-        subject: 'URGENT: Your Bank Account Access Has Been Suspended',
-        snippet: 'Your financial account security has been compromised. Immediate action is required to avoid permanent suspension. Please visit our verification portal.',
-        predicted_class: 'spam',
-        confidence: 96.5,
-        spam_probability: 96.5,
-        ham_probability: 3.5,
-        risk_score: 97,
-        risk_category: 'High Risk',
-        risk_level: 'high',
-        timestamp: new Date(Date.now() - 3600000 * 2).toISOString(),
-      },
-      {
-        id: 2,
-        subject: 'Q3 Engineering Sprint Retrospective Notes',
-        snippet: 'Hi team, thanks everyone for joining today\'s sprint retrospective. The action items and Jira ticket links are compiled on Confluence.',
-        predicted_class: 'ham',
-        confidence: 94.2,
-        spam_probability: 5.8,
-        ham_probability: 94.2,
-        risk_score: 6,
-        risk_category: 'Low Risk',
-        risk_level: 'low',
-        timestamp: new Date(Date.now() - 3600000 * 4).toISOString(),
-      },
-      {
-        id: 3,
-        subject: 'CONGRATULATIONS! You have been chosen for a $1,000,000 cash payout',
-        snippet: 'You have been selected as our grand prize winner of $1,000,000 cash. To claim your prize immediately, reply with your personal details and wire routing.',
-        predicted_class: 'spam',
-        confidence: 98.2,
-        spam_probability: 98.2,
-        ham_probability: 1.8,
-        risk_score: 98,
-        risk_category: 'High Risk',
-        risk_level: 'high',
-        timestamp: new Date(Date.now() - 3600000 * 8).toISOString(),
-      },
-      {
-        id: 4,
-        subject: 'Quarterly Budget Planning for Dev Team',
-        snippet: 'Hello Sarah, please find attached the draft figures for our server infrastructure budget for Q4. Cloud compute usage decreased by 8%.',
-        predicted_class: 'ham',
-        confidence: 91.8,
-        spam_probability: 8.2,
-        ham_probability: 91.8,
-        risk_score: 8,
-        risk_category: 'Low Risk',
-        risk_level: 'low',
-        timestamp: new Date(Date.now() - 3600000 * 12).toISOString(),
-      },
-      {
-        id: 5,
-        subject: 'Microsoft 365 Password Expiration Alert',
-        snippet: 'Your Microsoft 365 work email password will expire in 2 hours. To maintain access and keep your current password, verify your credentials here.',
-        predicted_class: 'spam',
-        confidence: 89.4,
-        spam_probability: 89.4,
-        ham_probability: 10.6,
-        risk_score: 89,
-        risk_category: 'High Risk',
-        risk_level: 'high',
-        timestamp: new Date(Date.now() - 3600000 * 24).toISOString(),
-      },
-    ];
-    localStorage.setItem('probmail_predictions', JSON.stringify(initialRecords));
+  private cleanLegacyDemoHistory() {
+    try {
+      const raw = localStorage.getItem('probmail_predictions');
+      if (!raw) return;
+      const records: PredictionRecord[] = JSON.parse(raw);
+      if (!Array.isArray(records)) return;
+
+      const demoSubjects = new Set([
+        'URGENT: Your Bank Account Access Has Been Suspended',
+        'Q3 Engineering Sprint Retrospective Notes',
+        'CONGRATULATIONS! You have been chosen for a $1,000,000 cash payout',
+        'Quarterly Budget Planning for Dev Team',
+        'Microsoft 365 Password Expiration Alert',
+      ]);
+
+      // Filter out only confirmed demo seeded records (by exact demo subject & numeric id <= 5)
+      const genuineRecords = records.filter(
+        (r) => !(r.id <= 5 && demoSubjects.has(r.subject))
+      );
+
+      if (genuineRecords.length !== records.length) {
+        localStorage.setItem('probmail_predictions', JSON.stringify(genuineRecords));
+      }
+    } catch {
+      // Ignore parsing errors
+    }
   }
 
   // Tokenization into unigrams & bigrams
@@ -573,8 +527,8 @@ class ProbMailEngine {
     return pipeline;
   }
 
-  // Predict email
-  public predictEmail(subject?: string, body?: string): PredictionResult {
+  // Predict email (optional recordHistory flag to prevent audit history pollution during transient pre-flight checks)
+  public predictEmail(subject?: string, body?: string, recordHistory: boolean = true): PredictionResult {
     const subjStr = (subject || '').trim();
     const bodyStr = (body || '').trim();
 
@@ -814,7 +768,9 @@ class ProbMailEngine {
       risk_category: riskCategory,
       risk_level: riskLevel,
     };
-    this.savePredictionRecord(record);
+    if (recordHistory) {
+      this.savePredictionRecord(record);
+    }
 
     return {
       status: 'success',
@@ -846,7 +802,7 @@ class ProbMailEngine {
         'Probability reflects the model\'s Bayesian posterior score P(Class | Words) based on learned training frequencies. This is a model-estimated probability, not an absolute guarantee.',
       subject_snippet: subjStr.substring(0, 80) || bodyStr.substring(0, 80) || 'Untitled',
       cleaned_length: tokens.length,
-      prediction_id: record.id,
+      prediction_id: recordHistory ? record.id : undefined,
     };
   }
 
