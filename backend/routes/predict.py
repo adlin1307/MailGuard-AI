@@ -58,8 +58,8 @@ def scan_email():
                 return jsonify({"error": f"Failed to read email file: {str(e)}"}), 400
 
     # Or standard JSON payload
+    json_data = request.get_json(silent=True) or {}
     if not body and not subject:
-        json_data = request.get_json(silent=True) or {}
         subject = json_data.get("subject")
         body = json_data.get("body") or json_data.get("text")
 
@@ -82,27 +82,36 @@ def scan_email():
         result["upload_info"] = upload_info
 
     # Save to SQLite prediction history, scoping to authenticated owner if present
-    try:
-        user = get_authenticated_user()
-        owner_id = user["user_id"] if user else None
+    # Check if recording history is explicitly disabled (e.g. for transient pre-flight checks or on-demand detail inspection)
+    record_history = True
+    if isinstance(json_data, dict):
+        if "record_history" in json_data:
+            record_history = bool(json_data["record_history"])
+        elif "recordHistory" in json_data:
+            record_history = bool(json_data["recordHistory"])
 
-        snippet_text = body_clean if body_clean else subj_clean
-        snippet = snippet_text[:120]
-        rec_id = save_prediction(
-            subject=subj_clean if subj_clean else "Untitled Email",
-            snippet=snippet,
-            predicted_class=result["predicted_class"],
-            confidence=result["confidence_percentage"],
-            spam_prob=result.get("spam_probability"),
-            ham_prob=result.get("ham_probability"),
-            risk_score=result.get("risk_score"),
-            owner_id=owner_id
-        )
-        result["prediction_id"] = rec_id
-        if owner_id:
-            result["owner_id"] = owner_id
-    except Exception as e:
-        print(f"Warning: Failed to save prediction to DB: {e}")
+    if record_history:
+        try:
+            user = get_authenticated_user()
+            owner_id = user["user_id"] if user else None
+
+            snippet_text = body_clean if body_clean else subj_clean
+            snippet = snippet_text[:120]
+            rec_id = save_prediction(
+                subject=subj_clean if subj_clean else "Untitled Email",
+                snippet=snippet,
+                predicted_class=result["predicted_class"],
+                confidence=result["confidence_percentage"],
+                spam_prob=result.get("spam_probability"),
+                ham_prob=result.get("ham_probability"),
+                risk_score=result.get("risk_score"),
+                owner_id=owner_id
+            )
+            result["prediction_id"] = rec_id
+            if owner_id:
+                result["owner_id"] = owner_id
+        except Exception as e:
+            print(f"Warning: Failed to save prediction to DB: {e}")
 
     return jsonify(result)
 
@@ -185,3 +194,36 @@ def download_scan_report_by_id(prediction_id: int):
         )
     except Exception as e:
         return jsonify({"error": f"Failed to generate scan report: {str(e)}"}), 500
+
+
+@predict_bp.route("/features/statistics/<term>", methods=["GET"])
+def get_term_statistics(term: str):
+    """
+    Returns actual training-set Chi-Square statistics, p-value, significance status,
+    and selection status for a feature term from the fitted statistical selector.
+    """
+    from ml.predict import get_feature_statistics
+    stats = get_feature_statistics(term)
+    return jsonify({
+        "status": "success",
+        "feature": stats
+    })
+
+
+@predict_bp.route("/features/statistics", methods=["POST"])
+def get_multiple_feature_statistics():
+    """
+    Returns actual training-set Chi-Square statistics for multiple terms.
+    """
+    from ml.predict import get_feature_statistics
+    data = request.get_json(silent=True) or {}
+    terms = data.get("terms") or data.get("features") or []
+    if not isinstance(terms, list):
+        return jsonify({"status": "error", "error": "terms must be a list of strings"}), 400
+
+    results = [get_feature_statistics(t) for t in terms]
+    return jsonify({
+        "status": "success",
+        "count": len(results),
+        "features": results
+    })

@@ -20,7 +20,35 @@ export interface MailItem {
   hamProbability: number;
   riskScore: number;
   riskLevel: 'low' | 'medium' | 'high';
-  topIndicators: { token: string; logOdds: number; impact: 'spam' | 'ham' }[];
+  topIndicators: {
+    token: string;
+    logOdds: number;
+    impact: 'spam' | 'ham';
+    chi2Score?: number;
+    pValue?: number;
+    pValueFormatted?: string;
+    trainingAssociation?: string;
+    predictionContribution?: string;
+    interpretation?: string;
+    isSignificant?: boolean;
+    significanceStatus?: string;
+    classAssociation?: string;
+  }[];
+  flagReasons?: { title: string; detail: string; highlighted_phrase?: string; category?: string }[];
+  explanation?: string;
+  suspiciousPhrases?: string[];
+  detectedLinks?: string[];
+  chi2Summary?: { method?: string; k_selected?: number; alpha_threshold?: number; description?: string; distinction_note?: string };
+}
+
+export interface DraftItem {
+  id: string;
+  userId?: string;
+  recipientEmail: string;
+  recipientName: string;
+  subject: string;
+  body: string;
+  updatedAt: string;
 }
 
 const STORAGE_KEY = 'probmail_mailbox_v2';
@@ -131,9 +159,22 @@ class MailService {
       riskLevel: pred.risk_level,
       topIndicators: (pred.influential_features || []).slice(0, 5).map((f) => ({
         token: f.word,
-        logOdds: f.impact_score,
-        impact: f.polarity.toLowerCase().includes('spam') ? 'spam' : 'ham',
+        logOdds: f.log_odds ?? f.impact_score,
+        impact: (f.predicted_impact || (f.polarity.toLowerCase().includes('spam') ? 'spam' : 'ham')) as 'spam' | 'ham',
+        chi2Score: f.chi2_score,
+        pValue: f.p_value,
+        pValueFormatted: f.p_value_formatted,
+        trainingAssociation: f.training_association,
+        predictionContribution: f.prediction_contribution,
+        interpretation: f.interpretation,
+        isSignificant: f.is_significant,
+        significanceStatus: f.significance_status,
+        classAssociation: f.class_association,
       })),
+      explanation: pred.verdict_summary || pred.explanation,
+      suspiciousPhrases: pred.suspicious_phrases,
+      detectedLinks: pred.detected_links,
+      chi2Summary: pred.chi2_summary,
     };
   }
 
@@ -177,8 +218,9 @@ class MailService {
     toEmail: string;
     subject: string;
     body: string;
+    draftId?: string;
   }): Promise<MailItem> {
-    const { from, toEmail, subject, body } = params;
+    const { from, toEmail, subject, body, draftId } = params;
 
     const trimmedTo = toEmail.toLowerCase().trim();
     if (!trimmedTo) {
@@ -196,39 +238,27 @@ class MailService {
     const recipientUser = registeredUsers.find((u) => u.email.toLowerCase() === trimmedTo);
     const toName = recipientUser ? recipientUser.name : trimmedTo.split('@')[0];
 
-    // Attempt backend persistence for shared cross-browser delivery
-    let savedMail: MailItem | null = null;
-    if (getStoredAuthToken()) {
-      try {
-        const res = await api.sendMailboxMessage({
-          recipient_email: trimmedTo,
-          recipient_name: toName,
-          subject: subject.trim(),
-          body: body.trim(),
-        });
-        if (res?.mail) {
-          savedMail = res.mail;
-        }
-      } catch (err: any) {
-        console.warn('Backend mailbox delivery warning:', err?.message);
-      }
+    // Must deliver via authenticated backend API - never fake email delivery
+    const res = await api.sendMailboxMessage({
+      recipient_email: trimmedTo,
+      recipient_name: toName,
+      subject: subject.trim(),
+      body: body.trim(),
+      draft_id: draftId,
+    });
+
+    if (!res || !res.mail) {
+      throw new Error('Failed to deliver message: invalid backend response.');
     }
 
-    if (!savedMail) {
-      savedMail = this.createMailRecord(
-        from.name,
-        from.email,
-        toName,
-        trimmedTo,
-        subject,
-        body,
-        new Date().toISOString(),
-        false
-      );
-    }
-
+    const savedMail: MailItem = res.mail;
     const messages = this.getStoredMessages();
-    messages.push(savedMail);
+    const existingIndex = messages.findIndex((m) => m.id === savedMail.id);
+    if (existingIndex >= 0) {
+      messages[existingIndex] = savedMail;
+    } else {
+      messages.push(savedMail);
+    }
     this.saveMessages(messages);
 
     return savedMail;
@@ -247,20 +277,16 @@ class MailService {
       if (spamRes?.messages) backendMsgs.push(...spamRes.messages);
       if (sentRes?.messages) backendMsgs.push(...sentRes.messages);
 
-      if (backendMsgs.length > 0) {
-        const local = this.getStoredMessages();
+      // Server is the authoritative source of truth for the authenticated user's mailbox
+      if (inboxRes || spamRes || sentRes) {
         const map = new Map<string, MailItem>();
-        for (const m of local) map.set(m.id, m);
         for (const m of backendMsgs) {
-          map.set(m.id, {
-            ...map.get(m.id),
-            ...m,
-          });
+          map.set(m.id, m);
         }
         this.saveMessages(Array.from(map.values()));
       }
     } catch {
-      // offline or backend error, use local
+      // offline fallback to cached messages
     }
   }
 
@@ -288,13 +314,20 @@ class MailService {
     }
   }
 
-  public toggleSpam(id: string): void {
+  public async toggleSpam(id: string): Promise<void> {
     const messages = this.getStoredMessages();
     const item = messages.find((m) => m.id === id);
     if (item) {
       item.isSpam = !item.isSpam;
       item.predictedClass = item.isSpam ? 'spam' : 'ham';
       this.saveMessages(messages);
+      if (getStoredAuthToken()) {
+        try {
+          await api.toggleMailboxSpam(id);
+        } catch (e) {
+          console.warn('Failed to toggle spam status on backend:', e);
+        }
+      }
     }
   }
 
@@ -305,6 +338,47 @@ class MailService {
     if (getStoredAuthToken()) {
       api.deleteMailboxMessage(id).catch(() => {});
     }
+  }
+
+  public async getSentRecipients(): Promise<{ email: string; name: string }[]> {
+    if (!getStoredAuthToken()) return [];
+    try {
+      const res = await api.getSentRecipients();
+      return res.recipients || [];
+    } catch {
+      return [];
+    }
+  }
+
+  public async getDrafts(): Promise<DraftItem[]> {
+    if (!getStoredAuthToken()) return [];
+    try {
+      const res = await api.getDrafts();
+      return res.drafts || [];
+    } catch {
+      return [];
+    }
+  }
+
+  public async saveDraft(params: {
+    id?: string;
+    recipientEmail?: string;
+    recipientName?: string;
+    subject?: string;
+    body?: string;
+  }): Promise<DraftItem> {
+    const res = await api.saveDraft({
+      id: params.id,
+      recipient_email: params.recipientEmail,
+      recipient_name: params.recipientName,
+      subject: params.subject,
+      body: params.body,
+    });
+    return res.draft;
+  }
+
+  public async deleteDraft(draftId: string): Promise<void> {
+    await api.deleteDraft(draftId);
   }
 }
 

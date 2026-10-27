@@ -11,29 +11,25 @@ htmlcov/
 
 # Model artifacts and local database
 backend/probmail.db
+backend/probmail.db*
+*.db
 backend/models/*.joblib
 backend/models/*.json
 !backend/models/.gitkeep
 
 # Node / Frontend
-<<<<<<< HEAD
-=======
 node_modules/
 dist/
 .vite/
 *.tsbuildinfo
->>>>>>> d47a9c144f76e2ea675e77041e320ed75c8258b5
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 *.log
 
-<<<<<<< HEAD
-=======
 # AI Studio artifacts / internals
 .aistudio/
 
->>>>>>> d47a9c144f76e2ea675e77041e320ed75c8258b5
 # Environment variables
 .env
 .env.local
@@ -41,7 +37,3 @@ frontend/.vite/
 # OS files
 .DS_Store
 Thumbs.db
-<<<<<<< HEAD
-=======
-
->>>>>>> d47a9c144f76e2ea675e77041e320ed75c8258b5

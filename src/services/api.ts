@@ -99,12 +99,53 @@ export const api = {
     setStoredAuthToken(null);
   },
 
+  async registerUser(payload: {
+    name: string;
+    email: string;
+    password?: string;
+    password_hash?: string;
+    salt?: string;
+    role?: string;
+    user_id?: string;
+  }): Promise<{ status: string; message: string; token: string; user: any }> {
+    const res = await requestJson<{ status: string; message: string; token: string; user: any }>(`${API_BASE}/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (res.token) {
+      setStoredAuthToken(res.token);
+    }
+    return res;
+  },
+
+  async loginUser(credentials: {
+    email: string;
+    password?: string;
+    password_hash?: string;
+  }): Promise<{ status: string; token: string; user: any }> {
+    const res = await requestJson<{ status: string; token: string; user: any }>(`${API_BASE}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(credentials),
+    });
+    if (res.token) {
+      setStoredAuthToken(res.token);
+    }
+    return res;
+  },
+
+  async getRegisteredUsers(): Promise<{ status: string; users: any[] }> {
+    return requestJson<{ status: string; users: any[] }>(`${API_BASE}/auth/users`);
+  },
+
   // Shared Backend Mailbox (Authenticated Cross-Browser Persistence)
   async sendMailboxMessage(payload: {
     recipient_email: string;
     recipient_name?: string;
     subject: string;
     body: string;
+    draft_id?: string;
   }): Promise<{ status: string; message: string; mail: any }> {
     return requestJson<{ status: string; message: string; mail: any }>(`${API_BASE}/mailbox/send`, {
       method: 'POST',
@@ -125,6 +166,34 @@ export const api = {
     return requestJson<{ status: string; count: number; messages: any[] }>(`${API_BASE}/mailbox/sent`);
   },
 
+  async getSentRecipients(): Promise<{ status: string; recipients: { email: string; name: string }[] }> {
+    return requestJson<{ status: string; recipients: { email: string; name: string }[] }>(`${API_BASE}/mailbox/recipients`);
+  },
+
+  async getDrafts(): Promise<{ status: string; count: number; drafts: any[] }> {
+    return requestJson<{ status: string; count: number; drafts: any[] }>(`${API_BASE}/mailbox/drafts`);
+  },
+
+  async saveDraft(payload: {
+    id?: string;
+    recipient_email?: string;
+    recipient_name?: string;
+    subject?: string;
+    body?: string;
+  }): Promise<{ status: string; message: string; draft: any }> {
+    return requestJson<{ status: string; message: string; draft: any }>(`${API_BASE}/mailbox/drafts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async deleteDraft(draftId: string): Promise<{ status: string; message: string }> {
+    return requestJson<{ status: string; message: string }>(`${API_BASE}/mailbox/drafts/${encodeURIComponent(draftId)}`, {
+      method: 'DELETE',
+    });
+  },
+
   async markMailboxRead(mailId: string): Promise<{ status: string; message: string }> {
     return requestJson<{ status: string; message: string }>(`${API_BASE}/mailbox/${encodeURIComponent(mailId)}/read`, {
       method: 'POST',
@@ -133,6 +202,12 @@ export const api = {
 
   async toggleMailboxStar(mailId: string): Promise<{ status: string; message: string }> {
     return requestJson<{ status: string; message: string }>(`${API_BASE}/mailbox/${encodeURIComponent(mailId)}/star`, {
+      method: 'POST',
+    });
+  },
+
+  async toggleMailboxSpam(mailId: string): Promise<{ status: string; message: string }> {
+    return requestJson<{ status: string; message: string }>(`${API_BASE}/mailbox/${encodeURIComponent(mailId)}/toggle-spam`, {
       method: 'POST',
     });
   },
@@ -215,7 +290,7 @@ export const api = {
   },
 
   // Prediction / Scanner
-  async predictEmail(payload: { subject?: string; body?: string }): Promise<PredictionResult> {
+  async predictEmail(payload: { subject?: string; body?: string; record_history?: boolean; recordHistory?: boolean }): Promise<PredictionResult> {
     return requestJson<PredictionResult>(`${API_BASE}/predict`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

@@ -5,6 +5,7 @@ Avoids storing sensitive raw email bodies while keeping snippets for audit verif
 """
 import sqlite3
 import os
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -106,6 +107,29 @@ def init_db(target_db: Optional[str] = None):
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_recipient ON mailbox_messages (recipient_email)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_sender ON mailbox_messages (sender_id)")
+
+        # Safely migrate mailbox_messages if analysis columns are missing
+        cursor.execute("PRAGMA table_info(mailbox_messages)")
+        mb_cols = {row[1] for row in cursor.fetchall()}
+        if "spam_probability" not in mb_cols:
+            cursor.execute("ALTER TABLE mailbox_messages ADD COLUMN spam_probability REAL")
+        if "ham_probability" not in mb_cols:
+            cursor.execute("ALTER TABLE mailbox_messages ADD COLUMN ham_probability REAL")
+        if "analysis_json" not in mb_cols:
+            cursor.execute("ALTER TABLE mailbox_messages ADD COLUMN analysis_json TEXT")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS drafts (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                recipient_email TEXT,
+                recipient_name TEXT,
+                subject TEXT,
+                body TEXT,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_drafts_user ON drafts (user_id)")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS training_history (
@@ -361,13 +385,21 @@ def save_user(user_id: str, name: str, email: str, password_hash: str, salt: str
 
 
 def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
-    """Retrieves a user by email."""
+    """Retrieves a user by email, ensuring trimmed and case-insensitive comparison."""
     clean_email = email.strip().lower()
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE email = ?", (clean_email,))
+        cursor.execute("SELECT * FROM users WHERE LOWER(TRIM(email)) = ?", (clean_email,))
         row = cursor.fetchone()
         return dict(row) if row else None
+
+
+def get_all_users() -> List[Dict[str, Any]]:
+    """Retrieves all registered user profiles (safe public fields only)."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, email, role, created_at FROM users ORDER BY name ASC")
+        return [dict(r) for r in cursor.fetchall()]
 
 
 def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
@@ -393,11 +425,23 @@ def save_mailbox_message(
     predicted_class: str = "ham",
     confidence: float = 95.0,
     risk_score: int = 0,
-    risk_level: str = "low"
+    risk_level: str = "low",
+    spam_probability: Optional[float] = None,
+    ham_probability: Optional[float] = None,
+    analysis_json: Optional[str] = None
 ) -> Dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
     clean_rec = recipient_email.strip().lower()
     clean_sender = sender_email.strip().lower()
+
+    if spam_probability is None or ham_probability is None:
+        if is_spam:
+            spam_probability = round(confidence, 2)
+            ham_probability = round(max(0.0, 100.0 - confidence), 2)
+        else:
+            ham_probability = round(confidence, 2)
+            spam_probability = round(max(0.0, 100.0 - confidence), 2)
+
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -405,14 +449,24 @@ def save_mailbox_message(
                 id, sender_id, sender_email, sender_name,
                 recipient_email, recipient_name, subject, body,
                 timestamp, is_read, starred, is_spam,
-                predicted_class, confidence, risk_score, risk_level
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)
+                predicted_class, confidence, risk_score, risk_level,
+                spam_probability, ham_probability, analysis_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             mail_id, sender_id, clean_sender, sender_name.strip(),
             clean_rec, recipient_name.strip(), subject.strip(), body.strip(),
-            now, 1 if is_spam else 0, predicted_class, confidence, risk_score, risk_level
+            now, 1 if is_spam else 0, predicted_class, confidence, risk_score, risk_level,
+            spam_probability, ham_probability, analysis_json
         ))
         conn.commit()
+
+    analysis_data = {}
+    if analysis_json:
+        try:
+            analysis_data = json.loads(analysis_json)
+        except Exception:
+            pass
+
     return {
         "id": mail_id,
         "fromName": sender_name.strip(),
@@ -427,12 +481,80 @@ def save_mailbox_message(
         "isSpam": is_spam,
         "predictedClass": predicted_class,
         "confidence": confidence,
+        "spamProbability": spam_probability,
+        "hamProbability": ham_probability,
         "riskScore": risk_score,
-        "riskLevel": risk_level
+        "riskLevel": risk_level,
+        "topIndicators": analysis_data.get("top_indicators", []),
+        "flagReasons": analysis_data.get("warning_signs", []),
+        "explanation": analysis_data.get("explanation", ""),
+        "suspiciousPhrases": analysis_data.get("suspicious_phrases", []),
+        "detectedLinks": analysis_data.get("detected_links", []),
+        "chi2Summary": analysis_data.get("chi2_summary"),
+        "recommendedPrecautions": analysis_data.get("recommended_precautions", []),
     }
 
 
+def update_mailbox_analysis_json(mail_id: str, analysis_json: str) -> bool:
+    """Updates the analysis_json payload of a mailbox message safely without altering email metadata."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE mailbox_messages
+            SET analysis_json = ?
+            WHERE id = ?
+        """, (analysis_json, mail_id))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
 def _format_mailbox_row(r: sqlite3.Row) -> Dict[str, Any]:
+    keys = set(r.keys())
+    analysis_data = {}
+    if "analysis_json" in keys and r["analysis_json"]:
+        try:
+            analysis_data = json.loads(r["analysis_json"])
+        except Exception:
+            pass
+
+    top_indicators = analysis_data.get("top_indicators", [])
+    chi2_summary = analysis_data.get("chi2_summary")
+
+    # If this record predates current Chi-Square explainability or has incomplete indicators,
+    # enrich it on-the-fly using the shared model pipeline without retraining.
+    needs_enrichment = (
+        not chi2_summary or
+        (top_indicators and any(
+            isinstance(ind, dict) and ind.get("chi2Score") is None and ind.get("chi2_score") is None
+            for ind in top_indicators
+        ))
+    )
+    if needs_enrichment and (r["subject"] or r["body"]):
+        try:
+            from ml.predict import generate_mailbox_analysis_payload
+            enriched = generate_mailbox_analysis_payload(r["subject"] or "", r["body"] or "")
+            if enriched and enriched.get("top_indicators"):
+                analysis_data = enriched
+                # Safely cache enriched analysis back to SQLite without altering any email metadata
+                try:
+                    update_mailbox_analysis_json(r["id"], json.dumps(enriched))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    conf = float(r["confidence"])
+    is_spam = bool(r["is_spam"])
+    if "spam_probability" in keys and r["spam_probability"] is not None:
+        spam_prob = float(r["spam_probability"])
+    else:
+        spam_prob = round(conf if is_spam else max(0.0, 100.0 - conf), 1)
+
+    if "ham_probability" in keys and r["ham_probability"] is not None:
+        ham_prob = float(r["ham_probability"])
+    else:
+        ham_prob = round(max(0.0, 100.0 - spam_prob), 1)
+
     return {
         "id": r["id"],
         "fromName": r["sender_name"],
@@ -444,12 +566,36 @@ def _format_mailbox_row(r: sqlite3.Row) -> Dict[str, Any]:
         "timestamp": r["timestamp"],
         "isRead": bool(r["is_read"]),
         "starred": bool(r["starred"]),
-        "isSpam": bool(r["is_spam"]),
+        "isSpam": is_spam,
         "predictedClass": r["predicted_class"],
-        "confidence": float(r["confidence"]),
+        "confidence": conf,
+        "spamProbability": spam_prob,
+        "hamProbability": ham_prob,
         "riskScore": int(r["risk_score"]),
-        "riskLevel": r["risk_level"]
+        "riskLevel": r["risk_level"],
+        "topIndicators": analysis_data.get("top_indicators", []),
+        "flagReasons": analysis_data.get("warning_signs", []),
+        "explanation": analysis_data.get("explanation", ""),
+        "suspiciousPhrases": analysis_data.get("suspicious_phrases", []),
+        "detectedLinks": analysis_data.get("detected_links", []),
+        "chi2Summary": analysis_data.get("chi2_summary"),
+        "recommendedPrecautions": analysis_data.get("recommended_precautions", []),
     }
+
+
+def toggle_message_spam(mail_id: str, user_email: str) -> bool:
+    """Toggles is_spam flag for moving messages between Inbox and Spam folders."""
+    clean_email = user_email.strip().lower()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE mailbox_messages
+            SET is_spam = CASE WHEN is_spam = 1 THEN 0 ELSE 1 END,
+                predicted_class = CASE WHEN is_spam = 1 THEN 'ham' ELSE 'spam' END
+            WHERE id = ? AND (recipient_email = ? OR sender_email = ?)
+        """, (mail_id, clean_email, clean_email))
+        conn.commit()
+        return cursor.rowcount > 0
 
 
 def get_inbox_messages(recipient_email: str) -> List[Dict[str, Any]]:
@@ -522,6 +668,124 @@ def delete_mailbox_message(mail_id: str, user_email: str) -> bool:
         """, (mail_id, clean_email, clean_email))
         conn.commit()
         return cursor.rowcount > 0
+
+
+def save_draft(
+    draft_id: str,
+    user_id: str,
+    recipient_email: str,
+    recipient_name: str,
+    subject: str,
+    body: str
+) -> Dict[str, Any]:
+    """Saves or updates a draft for the authenticated user without creating sent/received records."""
+    now_ts = datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO drafts (id, user_id, recipient_email, recipient_name, subject, body, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                recipient_email = excluded.recipient_email,
+                recipient_name = excluded.recipient_name,
+                subject = excluded.subject,
+                body = excluded.body,
+                updated_at = excluded.updated_at
+            WHERE user_id = excluded.user_id
+        """, (draft_id, user_id, recipient_email, recipient_name, subject, body, now_ts))
+        conn.commit()
+    return {
+        "id": draft_id,
+        "userId": user_id,
+        "recipientEmail": recipient_email,
+        "recipientName": recipient_name,
+        "subject": subject,
+        "body": body,
+        "updatedAt": now_ts
+    }
+
+
+def get_user_drafts(user_id: str) -> List[Dict[str, Any]]:
+    """Retrieves all drafts belonging exclusively to the authenticated user."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, user_id, recipient_email, recipient_name, subject, body, updated_at
+            FROM drafts
+            WHERE user_id = ?
+            ORDER BY updated_at DESC
+        """, (user_id,))
+        rows = cursor.fetchall()
+        return [
+            {
+                "id": r["id"],
+                "userId": r["user_id"],
+                "recipientEmail": r["recipient_email"] or "",
+                "recipientName": r["recipient_name"] or "",
+                "subject": r["subject"] or "",
+                "body": r["body"] or "",
+                "updatedAt": r["updated_at"]
+            }
+            for r in rows
+        ]
+
+
+def get_draft(draft_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieves a single draft, strictly enforcing user ownership."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, user_id, recipient_email, recipient_name, subject, body, updated_at
+            FROM drafts
+            WHERE id = ? AND user_id = ?
+        """, (draft_id, user_id))
+        r = cursor.fetchone()
+        if not r:
+            return None
+        return {
+            "id": r["id"],
+            "userId": r["user_id"],
+            "recipientEmail": r["recipient_email"] or "",
+            "recipientName": r["recipient_name"] or "",
+            "subject": r["subject"] or "",
+            "body": r["body"] or "",
+            "updatedAt": r["updated_at"]
+        }
+
+
+def delete_draft(draft_id: str, user_id: str) -> bool:
+    """Deletes a draft owned by the authenticated user."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM drafts WHERE id = ? AND user_id = ?", (draft_id, user_id))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def get_user_sent_recipients(sender_id: str, sender_email: str) -> List[Dict[str, str]]:
+    """
+    Returns distinct recipients to whom the logged-in user has previously sent emails.
+    Excludes the user themselves and deduplicates by lowercase recipient email.
+    """
+    clean_sender_email = sender_email.strip().lower()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT DISTINCT recipient_email, recipient_name
+            FROM mailbox_messages
+            WHERE sender_id = ? AND LOWER(recipient_email) != ?
+            ORDER BY timestamp DESC
+        """, (sender_id, clean_sender_email))
+        rows = cursor.fetchall()
+        seen = set()
+        recipients = []
+        for r in rows:
+            em = (r["recipient_email"] or "").strip().lower()
+            if em and em not in seen:
+                seen.add(em)
+                name = (r["recipient_name"] or "").strip() or em.split("@")[0]
+                recipients.append({"email": em, "name": name})
+        return recipients
 
 
 def log_training_run(metadata: Dict[str, Any]):

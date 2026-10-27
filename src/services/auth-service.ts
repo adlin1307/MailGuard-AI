@@ -133,17 +133,55 @@ class AuthService {
     }
   }
 
+  private cacheUserAccount(account: StoredUserAccount): void {
+    const users = this.getStoredUsers();
+    const idx = users.findIndex((u) => u.email.toLowerCase() === account.email.toLowerCase());
+    if (idx >= 0) {
+      users[idx] = { ...users[idx], ...account };
+    } else {
+      users.push(account);
+    }
+    this.saveStoredUsers(users);
+  }
+
   public getRegisteredUserCount(): number {
     return this.getStoredUsers().length;
   }
 
   public getAllRegisteredUsers(): { id: string; name: string; email: string; role: string }[] {
+    // Return cached users immediately
     return this.getStoredUsers().map((u) => ({
       id: u.id,
       name: u.name,
       email: u.email,
       role: u.role,
     }));
+  }
+
+  public async syncUsersFromBackend(): Promise<void> {
+    try {
+      const res = await api.getRegisteredUsers();
+      if (res && Array.isArray(res.users)) {
+        const localUsers = this.getStoredUsers();
+        for (const remoteUser of res.users) {
+          const exists = localUsers.find((u) => u.email.toLowerCase() === remoteUser.email.toLowerCase());
+          if (!exists) {
+            localUsers.push({
+              id: remoteUser.id,
+              name: remoteUser.name,
+              email: remoteUser.email.toLowerCase(),
+              salt: '',
+              passwordHash: '',
+              role: remoteUser.role || 'SecOps Analyst',
+              createdAt: remoteUser.created_at || new Date().toISOString(),
+            });
+          }
+        }
+        this.saveStoredUsers(localUsers);
+      }
+    } catch {
+      // Ignore background sync errors
+    }
   }
 
   public checkEmailExists(email: string): boolean {
@@ -175,12 +213,6 @@ class AuthService {
       throw new Error('Please enter a valid email address (e.g., analyst@security.org).');
     }
 
-    if (this.checkEmailExists(trimmedEmail)) {
-      throw new Error(
-        'An account with this email address is already registered. Please go to Login.'
-      );
-    }
-
     const passwordVal = validatePassword(password);
     if (!passwordVal.hasMinLength) {
       throw new Error('Password must be at least 8 characters long.');
@@ -202,35 +234,72 @@ class AuthService {
     // 2. Cryptographic Salt & Hash
     const salt = generateRandomSalt();
     const passwordHash = await hashPasswordWithSalt(password, salt);
-
+    const userId = `usr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const role = params.role || 'SecOps Analyst';
     const now = new Date().toISOString();
-    const newUserAccount: StoredUserAccount = {
-      id: `usr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      name: name.trim(),
-      email: trimmedEmail,
-      salt,
-      passwordHash,
-      role: params.role || 'SecOps Analyst',
-      createdAt: now,
-      lastLogin: now,
-    };
 
-    const users = this.getStoredUsers();
-    users.push(newUserAccount);
-    this.saveStoredUsers(users);
+    // 3. Register user with backend SQLite database
+    try {
+      const res = await api.registerUser({
+        user_id: userId,
+        name: name.trim(),
+        email: trimmedEmail,
+        password,
+        password_hash: passwordHash,
+        salt,
+        role,
+      });
 
-    const publicUser: User = {
-      id: newUserAccount.id,
-      name: newUserAccount.name,
-      email: newUserAccount.email,
-      role: newUserAccount.role,
-      createdAt: newUserAccount.createdAt,
-      lastLogin: newUserAccount.lastLogin,
-    };
+      const registeredUser: User = {
+        id: res.user?.user_id || res.user?.id || userId,
+        name: res.user?.name || name.trim(),
+        email: res.user?.email || trimmedEmail,
+        role: res.user?.role || role,
+        createdAt: res.user?.created_at || now,
+        lastLogin: now,
+      };
 
-    // Auto-login session on successful signup
-    this.setSession(publicUser);
-    return publicUser;
+      const accountRecord: StoredUserAccount = {
+        id: registeredUser.id,
+        name: registeredUser.name,
+        email: registeredUser.email,
+        salt,
+        passwordHash,
+        role: registeredUser.role,
+        createdAt: registeredUser.createdAt,
+        lastLogin: now,
+      };
+      this.cacheUserAccount(accountRecord);
+      this.setSession(registeredUser);
+      return registeredUser;
+    } catch (err: any) {
+      const msg = err?.message || '';
+      if (msg.includes('already registered')) {
+        throw new Error('An account with this email address is already registered. Please go to Login.');
+      }
+      // If backend network call failed completely, fallback to storing locally
+      const localAccount: StoredUserAccount = {
+        id: userId,
+        name: name.trim(),
+        email: trimmedEmail,
+        salt,
+        passwordHash,
+        role,
+        createdAt: now,
+        lastLogin: now,
+      };
+      this.cacheUserAccount(localAccount);
+      const publicUser: User = {
+        id: userId,
+        name: name.trim(),
+        email: trimmedEmail,
+        role,
+        createdAt: now,
+        lastLogin: now,
+      };
+      this.setSession(publicUser);
+      return publicUser;
+    }
   }
 
   public async login(params: {
@@ -252,37 +321,139 @@ class AuthService {
       throw new Error('Please enter your password.');
     }
 
-    const users = this.getStoredUsers();
-    const account = users.find((u) => u.email.toLowerCase() === trimmedEmail);
+    // 1. Attempt authentication with backend SQLite database
+    try {
+      const res = await api.loginUser({
+        email: trimmedEmail,
+        password,
+      });
 
-    // Explicit requirement: "ONCE SIGNUP ONLY WE SHOULD BE ABLE TO LOGIN"
-    if (!account) {
-      throw new Error(
-        'No registered account found with this email. You must sign up first before logging in.'
-      );
+      if (res && res.user) {
+        const publicUser: User = {
+          id: res.user.user_id || res.user.id,
+          name: res.user.name,
+          email: res.user.email,
+          role: res.user.role || 'SecOps Analyst',
+          createdAt: res.user.created_at || new Date().toISOString(),
+          lastLogin: new Date().toISOString(),
+        };
+
+        // Cache in local storage for session consistency
+        const localUsers = this.getStoredUsers();
+        const existingLocal = localUsers.find((u) => u.email.toLowerCase() === trimmedEmail);
+        if (existingLocal) {
+          existingLocal.lastLogin = publicUser.lastLogin;
+          this.saveStoredUsers(localUsers);
+        } else {
+          this.cacheUserAccount({
+            id: publicUser.id,
+            name: publicUser.name,
+            email: publicUser.email,
+            salt: '',
+            passwordHash: '',
+            role: publicUser.role,
+            createdAt: publicUser.createdAt,
+            lastLogin: publicUser.lastLogin,
+          });
+        }
+
+        this.setSession(publicUser);
+        return publicUser;
+      }
+      throw new Error('Login failed: unexpected backend response.');
+    } catch (err: any) {
+      const errorMsg = err?.message || '';
+
+      // Check for account not found (404)
+      if (
+        errorMsg.includes('No registered account') ||
+        errorMsg.includes('not found') ||
+        errorMsg.includes('sign up first')
+      ) {
+        // Fallback: check if the account exists in localStorage (e.g. from earlier local-only signup)
+        const localUsers = this.getStoredUsers();
+        const localAccount = localUsers.find((u) => u.email.toLowerCase() === trimmedEmail);
+        if (localAccount && localAccount.salt && localAccount.passwordHash) {
+          // Verify password locally
+          const computedHash = await hashPasswordWithSalt(password, localAccount.salt);
+          if (computedHash === localAccount.passwordHash) {
+            // Auto-migrate account to backend SQLite database
+            try {
+              const regRes = await api.registerUser({
+                user_id: localAccount.id,
+                name: localAccount.name,
+                email: localAccount.email,
+                password_hash: localAccount.passwordHash,
+                salt: localAccount.salt,
+                role: localAccount.role,
+              });
+              if (regRes && regRes.user) {
+                const migratedUser: User = {
+                  id: regRes.user.user_id || regRes.user.id,
+                  name: regRes.user.name,
+                  email: regRes.user.email,
+                  role: regRes.user.role || localAccount.role,
+                  createdAt: localAccount.createdAt,
+                  lastLogin: new Date().toISOString(),
+                };
+                this.setSession(migratedUser);
+                return migratedUser;
+              }
+            } catch {
+              // If backend registration failed, still allow valid local account
+            }
+            const publicUser: User = {
+              id: localAccount.id,
+              name: localAccount.name,
+              email: localAccount.email,
+              role: localAccount.role,
+              createdAt: localAccount.createdAt,
+              lastLogin: new Date().toISOString(),
+            };
+            this.setSession(publicUser);
+            return publicUser;
+          } else {
+            throw new Error('Incorrect password. Please verify your credentials and try again.');
+          }
+        }
+        throw new Error(
+          'No registered account found with this email. You must sign up first before logging in.'
+        );
+      }
+
+      // Check for incorrect credentials (401)
+      if (errorMsg.includes('Incorrect password') || errorMsg.includes('Authentication failed')) {
+        throw new Error('Incorrect password. Please verify your credentials and try again.');
+      }
+
+      // If backend network error (e.g. backend server not running):
+      const localUsers = this.getStoredUsers();
+      const localAccount = localUsers.find((u) => u.email.toLowerCase() === trimmedEmail);
+      if (localAccount && localAccount.salt && localAccount.passwordHash) {
+        const computedHash = await hashPasswordWithSalt(password, localAccount.salt);
+        if (computedHash !== localAccount.passwordHash) {
+          throw new Error('Incorrect password. Please verify your credentials and try again.');
+        }
+        const publicUser: User = {
+          id: localAccount.id,
+          name: localAccount.name,
+          email: localAccount.email,
+          role: localAccount.role,
+          createdAt: localAccount.createdAt,
+          lastLogin: new Date().toISOString(),
+        };
+        this.setSession(publicUser);
+        return publicUser;
+      }
+
+      if (!localAccount && (errorMsg.includes('Failed to fetch') || errorMsg.includes('NetworkError'))) {
+        throw new Error(
+          'No registered account found with this email. You must sign up first before logging in.'
+        );
+      }
+
+      throw new Error(errorMsg || 'Login failed. Please try again.');
     }
-
-    // Verify Password Hash
-    const computedHash = await hashPasswordWithSalt(password, account.salt);
-    if (computedHash !== account.passwordHash) {
-      throw new Error('Incorrect password. Please verify your credentials and try again.');
-    }
-
-    // Update last login
-    account.lastLogin = new Date().toISOString();
-    this.saveStoredUsers(users);
-
-    const publicUser: User = {
-      id: account.id,
-      name: account.name,
-      email: account.email,
-      role: account.role,
-      createdAt: account.createdAt,
-      lastLogin: account.lastLogin,
-    };
-
-    this.setSession(publicUser);
-    return publicUser;
   }
 
   public logout(): void {

@@ -56,6 +56,12 @@ def get_authenticated_user() -> Optional[Dict[str, str]]:
         token = request.headers.get("X-ProbMail-Token").strip()
 
     if not token:
+        token = request.args.get("token")
+    if not token and request.is_json:
+        data = request.get_json(silent=True) or {}
+        token = data.get("token")
+
+    if not token:
         return None
 
     return verify_auth_token(token)

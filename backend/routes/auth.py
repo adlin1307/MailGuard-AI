@@ -8,7 +8,7 @@ import hashlib
 import secrets
 from flask import Blueprint, request, jsonify, current_app
 from services.auth_helper import generate_auth_token, get_authenticated_user
-from services.db import get_user_by_email, save_user
+from services.db import get_user_by_email, save_user, get_all_users
 
 auth_bp = Blueprint("auth", __name__)
 
@@ -168,7 +168,7 @@ def login_user():
 
     user = get_user_by_email(email)
     if not user:
-        return jsonify({"status": "error", "error": "No registered account found with this email. Please sign up first."}), 404
+        return jsonify({"status": "error", "error": "No registered account found with this email. You must sign up first before logging in."}), 404
 
     valid = False
     if password_hash and password_hash.lower() == user["password_hash"].lower():
@@ -189,6 +189,19 @@ def login_user():
             "name": user["name"],
             "role": user.get("role", "SecOps Analyst")
         }
+    })
+
+
+@auth_bp.route("/auth/users", methods=["GET"])
+def get_registered_users_list():
+    """
+    Returns list of public user profiles for recipient selection and user directories.
+    Excludes sensitive credentials (passwords, salts).
+    """
+    users = get_all_users()
+    return jsonify({
+        "status": "success",
+        "users": users
     })
 
 

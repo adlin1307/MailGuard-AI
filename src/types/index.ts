@@ -86,6 +86,27 @@ export interface InfluentialFeature {
   impact_score: number;
   badge: 'danger' | 'success' | 'neutral';
   description: string;
+  log_odds?: number;
+  predicted_impact?: string;
+  chi2_score?: number;
+  p_value?: number;
+  p_value_formatted?: string;
+  training_association?: string;
+  prediction_contribution?: string;
+  interpretation?: string;
+  is_significant?: boolean;
+  significance_status?: string;
+  class_association?: string;
+}
+
+export interface DraftItem {
+  id: string;
+  userId: string;
+  recipientEmail: string;
+  recipientName: string;
+  subject: string;
+  body: string;
+  updatedAt: string;
 }
 
 export interface PredictionResult {
@@ -111,6 +132,20 @@ export interface PredictionResult {
     test_accuracy?: number | null;
     algorithm?: string;
     bayesian_explanation?: string;
+    chi2_summary?: {
+      method?: string;
+      k_selected?: number;
+      alpha_threshold?: number;
+      description?: string;
+      distinction_note?: string;
+    };
+  };
+  chi2_summary?: {
+    method?: string;
+    k_selected?: number;
+    alpha_threshold?: number;
+    description?: string;
+    distinction_note?: string;
   };
   accuracy_note?: string;
   disclaimer: string;
@@ -123,6 +158,9 @@ export interface PredictionResult {
     label: string;
   };
   error?: string;
+  explanation?: string;
+  suspicious_phrases?: string[];
+  detected_links?: string[];
 }
 
 export interface PreprocessingSummary {

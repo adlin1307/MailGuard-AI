@@ -632,14 +632,60 @@ class ProbMailEngine {
       if (Math.abs(contrib) > 0.02) {
         const isSpamInd = contrib > 0.02;
         const isHamInd = contrib < -0.02;
+        const chi2Entry = pipe.chiSquareSummary?.features.find((f) => f.feature === t);
+        const chi2Score = chi2Entry?.chi2_score;
+        const pVal = chi2Entry?.p_value;
+        const pValFmt = chi2Entry?.p_value_formatted ?? (pVal !== undefined && !isNaN(pVal) ? (pVal < 0.001 ? 'p < 0.001' : `p = ${pVal.toFixed(4)}`) : 'Unavailable');
+        const isSig = chi2Entry?.is_significant ?? (pVal !== undefined && !isNaN(pVal) ? pVal < 0.05 : false);
+
+        let sigStatus = 'Unavailable';
+        let classAssoc = 'Unavailable';
+        if (pVal !== undefined && !isNaN(pVal)) {
+          if (pVal < 0.001) {
+            sigStatus = 'Highly Significant';
+          } else if (pVal < 0.05) {
+            sigStatus = 'Statistically Significant';
+          } else {
+            sigStatus = 'Not Statistically Significant';
+          }
+          classAssoc = diffLp > 0.02 ? 'Spam-associated' : diffLp < -0.02 ? 'Ham-associated' : 'Neutral / Shared';
+        }
+
+        const predContrib = isSpamInd
+          ? `+${Math.abs(contrib).toFixed(2)} log-odds (favors Spam)`
+          : isHamInd
+          ? `-${Math.abs(contrib).toFixed(2)} log-odds (favors Ham)`
+          : '0.00 log-odds (neutral contribution)';
+
+        const trainingAssoc = chi2Score !== undefined && pVal !== undefined && !isNaN(pVal)
+          ? `χ² = ${chi2Score.toFixed(2)}, ${pValFmt} (${sigStatus})`
+          : 'Chi-Square statistics unavailable';
+
+        const interpretation = isSpamInd
+          ? `${classAssoc} in training data (${pValFmt}). Shifts current prediction toward Spam by +${Math.abs(contrib).toFixed(2)} log-odds.`
+          : isHamInd
+          ? `${classAssoc} in training data (${pValFmt}). Shifts current prediction toward Ham by -${Math.abs(contrib).toFixed(2)} log-odds.`
+          : `Retained in model vocabulary (${pValFmt}), with neutral directional impact on this email.`;
+
         influentialFeatures.push({
           word: t,
           polarity: isSpamInd ? 'Spam Indicator' : isHamInd ? 'Ham Indicator' : 'Neutral',
+          predicted_impact: isSpamInd ? 'spam' : isHamInd ? 'ham' : 'neutral',
           impact_score: Number(Math.abs(contrib).toFixed(2)),
+          log_odds: Number(contrib.toFixed(4)),
           badge: isSpamInd ? 'danger' : isHamInd ? 'success' : 'neutral',
           description: isSpamInd
-            ? `Term '${t}' shifted model towards Spam (+${Math.abs(contrib).toFixed(2)} log-odds).`
-            : `Term '${t}' shifted model towards Ham (-${Math.abs(contrib).toFixed(2)} log-odds).`,
+            ? `Term '${t}' contributed +${Math.abs(contrib).toFixed(2)} to the model's Bayesian spam log-odds.`
+            : `Term '${t}' shifted the model toward Ham by -${Math.abs(contrib).toFixed(2)} in log-odds.`,
+          chi2_score: chi2Score,
+          p_value: pVal,
+          p_value_formatted: pValFmt,
+          is_significant: isSig,
+          significance_status: sigStatus,
+          class_association: classAssoc,
+          training_association: trainingAssoc,
+          prediction_contribution: predContrib,
+          interpretation,
         });
       }
     });
@@ -796,6 +842,13 @@ class ProbMailEngine {
         algorithm: 'Multinomial Naive Bayes + Chi-Square Selection (SelectKBest)',
         bayesian_explanation:
           'Posterior probabilities are calculated using Bayes\' Rule: P(Spam | Text) ∝ P(Spam) · ∏ P(Word | Spam). Chi-Square selection retains terms with statistically significant class dependence (p < 0.05).',
+      },
+      chi2_summary: {
+        method: 'SelectKBest(score_func=chi2)',
+        k_selected: pipe.chiSquareSummary?.selected_k ?? 50,
+        alpha_threshold: 0.05,
+        description: 'Chi-Square (χ²) evaluates statistical dependence between words and Spam/Ham labels during model training (significance threshold α = 0.05).',
+        distinction_note: 'Training-time χ² p-values reflect vocabulary feature importance across the dataset, distinct from this email\'s Bayesian posterior classification probabilities.',
       },
       accuracy_note: `Estimated probability (${confidence.toFixed(1)}%) is this specific email\'s likelihood score. Overall model test accuracy is ${(testAcc * 100).toFixed(1)}% on held-out test data.`,
       disclaimer:

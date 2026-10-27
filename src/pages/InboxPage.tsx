@@ -20,34 +20,46 @@ import {
   ChevronRight,
   Shield,
   Layers,
+  ExternalLink,
+  Loader2,
+  FileEdit,
+  CheckCircle,
 } from 'lucide-react';
-import { mailService, MailItem } from '../services/mail-service';
-import { User, authService } from '../services/auth-service';
+import { mailService, MailItem, DraftItem } from '../services/mail-service';
+import { User } from '../services/auth-service';
 import { mlEngine } from '../services/ml-engine';
+import { api } from '../services/api';
 import { generateScanReportPdf, triggerFileDownload } from '../services/pdf-generator';
 import { PredictionResult } from '../types';
+import { StatisticalAnalysisView } from '../components/StatisticalAnalysisView';
 
 interface InboxPageProps {
   currentUser: User;
   onLogout?: () => void;
 }
 
-type MailFolder = 'inbox' | 'spam' | 'sent' | 'starred';
+type MailFolder = 'inbox' | 'spam' | 'sent' | 'starred' | 'drafts';
 
 export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) => {
   const [currentFolder, setCurrentFolder] = useState<MailFolder>('inbox');
   const [mails, setMails] = useState<MailItem[]>([]);
+  const [drafts, setDrafts] = useState<DraftItem[]>([]);
   const [selectedMail, setSelectedMail] = useState<MailItem | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterVerdict, setFilterVerdict] = useState<'all' | 'spam' | 'ham'>('all');
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [showAnalysis, setShowAnalysis] = useState(false);
+  const [loadingAnalysis, setLoadingAnalysis] = useState(false);
 
   // Compose Modal State
   const [showCompose, setShowCompose] = useState(false);
+  const [composeDraftId, setComposeDraftId] = useState<string | null>(null);
   const [composeTo, setComposeTo] = useState('');
   const [composeSubject, setComposeSubject] = useState('');
   const [composeBody, setComposeBody] = useState('');
   const [composeSending, setComposeSending] = useState(false);
+  const [isSavingDraft, setIsSavingDraft] = useState(false);
+  const [draftNotice, setDraftNotice] = useState<string | null>(null);
   const [composeError, setComposeError] = useState<string | null>(null);
   const [composeSuccess, setComposeSuccess] = useState<string | null>(null);
 
@@ -55,12 +67,11 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
   const [livePreview, setLivePreview] = useState<PredictionResult | null>(null);
   const [isCheckingPreview, setIsCheckingPreview] = useState(false);
 
-  // Other registered users in the system for quick recipient selection
-  const [registeredUsers, setRegisteredUsers] = useState<
-    { id: string; name: string; email: string; role: string }[]
-  >([]);
+  // Sent recipients history for the current user
+  const [sentRecipients, setSentRecipients] = useState<{ email: string; name: string }[]>([]);
+  const [recipientSuggestions, setRecipientSuggestions] = useState<{ email: string; name: string }[]>([]);
 
-  // Load emails
+  // Load emails and drafts
   const loadMails = async () => {
     setIsRefreshing(true);
 
@@ -91,11 +102,17 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
       }
     }
 
-    // Refresh other users
-    const allUsers = authService.getAllRegisteredUsers();
-    setRegisteredUsers(
-      allUsers.filter((u) => u.email.toLowerCase() !== currentUser.email.toLowerCase())
-    );
+    // Load drafts and sent recipients
+    try {
+      const [userDrafts, userRecipients] = await Promise.all([
+        mailService.getDrafts(),
+        mailService.getSentRecipients(),
+      ]);
+      setDrafts(userDrafts);
+      setSentRecipients(userRecipients);
+    } catch {
+      // ignore
+    }
 
     setIsRefreshing(false);
   };
@@ -104,9 +121,97 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
     loadMails();
   }, [currentFolder, currentUser.email]);
 
+  // Reset Show Analysis visibility whenever switching to another email or deselecting
+  useEffect(() => {
+    setShowAnalysis(false);
+    setLoadingAnalysis(false);
+  }, [selectedMail?.id]);
+
+  const handleToggleAnalysis = async () => {
+    if (showAnalysis) {
+      setShowAnalysis(false);
+      return;
+    }
+    if (!selectedMail) return;
+
+    // If probabilities or Chi-Square statistics are missing on this email, query real backend ML without recording history
+    const needsEnrichment =
+      selectedMail.spamProbability === undefined ||
+      !selectedMail.chi2Summary ||
+      (selectedMail.topIndicators &&
+        selectedMail.topIndicators.length > 0 &&
+        selectedMail.topIndicators.some(
+          (ind) => ind.chi2Score === undefined && (ind as any).chi2_score === undefined
+        ));
+
+    if (
+      needsEnrichment &&
+      (selectedMail.subject?.trim() || selectedMail.body?.trim())
+    ) {
+      setLoadingAnalysis(true);
+      try {
+        const pred = await api.predictEmail({
+          subject: selectedMail.subject,
+          body: selectedMail.body,
+          record_history: false,
+        });
+        if (pred && pred.status === 'success') {
+          const updated: MailItem = {
+            ...selectedMail,
+            isSpam: pred.predicted_class === 'spam',
+            predictedClass: pred.predicted_class as 'ham' | 'spam',
+            spamProbability:
+              pred.spam_probability ??
+              (pred.predicted_class === 'spam'
+                ? pred.confidence_percentage
+                : 100 - pred.confidence_percentage),
+            hamProbability:
+              pred.ham_probability ??
+              (pred.predicted_class === 'ham'
+                ? pred.confidence_percentage
+                : 100 - (pred.spam_probability ?? 50)),
+            riskScore: pred.risk_score ?? Math.round(pred.spam_probability ?? 0),
+            topIndicators: (pred.influential_features || []).map((f) => ({
+              token: f.word,
+              logOdds: f.log_odds ?? f.impact_score ?? 0,
+              impact: (f.predicted_impact || (f.polarity === 'spam' || f.badge === 'danger' ? 'spam' : 'ham')) as 'spam' | 'ham',
+              chi2Score: f.chi2_score,
+              pValue: f.p_value,
+              pValueFormatted: f.p_value_formatted,
+              trainingAssociation: f.training_association,
+              predictionContribution: f.prediction_contribution,
+              interpretation: f.interpretation,
+              isSignificant: f.is_significant,
+              significanceStatus: f.significance_status,
+              classAssociation: f.class_association,
+            })),
+            flagReasons: (pred.warning_signs || []).map((w) => ({
+              title: typeof w === 'string' ? 'Warning' : w.title || 'Warning',
+              detail: typeof w === 'string' ? w : w.detail,
+              category: typeof w === 'string' ? 'Warning' : w.category || 'Warning',
+              highlighted_phrase: typeof w === 'string' ? undefined : w.highlighted_phrase,
+            })),
+            explanation: pred.verdict_summary || pred.explanation,
+            suspiciousPhrases: pred.suspicious_phrases,
+            detectedLinks: pred.detected_links,
+            chi2Summary: pred.chi2_summary,
+          };
+          setSelectedMail(updated);
+          setMails((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
+        }
+      } catch (err) {
+        console.warn('Could not retrieve on-demand analysis for email:', err);
+      } finally {
+        setLoadingAnalysis(false);
+      }
+    }
+    setShowAnalysis(true);
+  };
+
   const handleSelectMail = (mail: MailItem) => {
     mailService.markAsRead(mail.id);
     setSelectedMail({ ...mail, isRead: true });
+    setShowAnalysis(false);
     setMails((prev) =>
       prev.map((m) => (m.id === mail.id ? { ...m, isRead: true } : m))
     );
@@ -123,9 +228,9 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
     }
   };
 
-  const handleToggleSpam = (id: string) => {
-    mailService.toggleSpam(id);
-    loadMails();
+  const handleToggleSpam = async (id: string) => {
+    await mailService.toggleSpam(id);
+    await loadMails();
     if (selectedMail && selectedMail.id === id) {
       setSelectedMail(null);
     }
@@ -159,15 +264,95 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
     );
   };
 
-  const handleOpenCompose = (prefillTo?: string, prefillSubject?: string) => {
+  const handleOpenCompose = (
+    prefillTo?: string,
+    prefillSubject?: string,
+    draftId?: string,
+    prefillBody?: string
+  ) => {
+    setComposeDraftId(draftId || null);
     setComposeTo(prefillTo || '');
     setComposeSubject(prefillSubject || '');
-    setComposeBody('');
+    setComposeBody(prefillBody || '');
+    setRecipientSuggestions([]);
     setComposeError(null);
     setComposeSuccess(null);
+    setDraftNotice(null);
     setLivePreview(null);
     setIsCheckingPreview(false);
     setShowCompose(true);
+  };
+
+  const handleOpenDraft = (draft: DraftItem) => {
+    handleOpenCompose(draft.recipientEmail, draft.subject, draft.id, draft.body);
+  };
+
+  const handleSaveDraft = async (isAutosave = false) => {
+    const hasContent = Boolean(
+      composeTo.trim() || composeSubject.trim() || composeBody.trim()
+    );
+    if (!hasContent) {
+      return;
+    }
+
+    setIsSavingDraft(true);
+    try {
+      const activeDraftId =
+        composeDraftId ||
+        `draft_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+      const saved = await mailService.saveDraft({
+        id: activeDraftId,
+        recipientEmail: composeTo.trim(),
+        subject: composeSubject.trim(),
+        body: composeBody.trim(),
+      });
+
+      if (saved && saved.id) {
+        setComposeDraftId(saved.id);
+      } else {
+        setComposeDraftId(activeDraftId);
+      }
+
+      // Refresh drafts list without full page reload
+      const updatedDrafts = await mailService.getDrafts();
+      setDrafts(updatedDrafts);
+
+      setDraftNotice(isAutosave ? 'Draft autosaved' : 'Draft saved');
+      setTimeout(() => setDraftNotice(null), 3000);
+    } catch (err: any) {
+      if (!isAutosave) {
+        setComposeError('Failed to save draft: ' + (err.message || 'Server error'));
+      }
+    } finally {
+      setIsSavingDraft(false);
+    }
+  };
+
+  const handleCloseCompose = async () => {
+    // Preserve unsent content as draft if user entered anything
+    const hasContent = Boolean(
+      composeTo.trim() || composeSubject.trim() || composeBody.trim()
+    );
+    if (hasContent && !composeSuccess) {
+      await handleSaveDraft(true);
+    }
+    setShowCompose(false);
+    setComposeDraftId(null);
+    setRecipientSuggestions([]);
+  };
+
+  const handleDeleteDraft = async (draftId: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    try {
+      await mailService.deleteDraft(draftId);
+      setDrafts((prev) => prev.filter((d) => d.id !== draftId));
+      if (composeDraftId === draftId) {
+        setComposeDraftId(null);
+      }
+    } catch (err) {
+      console.warn('Failed to delete draft:', err);
+    }
   };
 
   const handleSendMail = async (e: React.FormEvent) => {
@@ -190,16 +375,18 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
 
     setComposeSending(true);
     try {
-      const sent = await mailService.sendMail({
+      await mailService.sendMail({
         from: currentUser,
         toEmail: composeTo,
         subject: composeSubject,
         body: composeBody,
+        draftId: composeDraftId || undefined,
       });
 
       setComposeSuccess(
         `Message sent to in-app recipient (${composeTo.trim()}). Stored in Sent mail.`
       );
+      setComposeDraftId(null);
       setTimeout(() => {
         setShowCompose(false);
         setComposeSending(false);
@@ -247,6 +434,28 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
     };
   }, [showCompose, composeSubject, composeBody]);
 
+  // Preserve draft on window refresh/unload if user is composing
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (showCompose && (composeTo.trim() || composeSubject.trim() || composeBody.trim())) {
+        const draftPayload = {
+          id: composeDraftId || `draft_${Date.now()}_autosave`,
+          recipient_email: composeTo.trim(),
+          subject: composeSubject.trim(),
+          body: composeBody.trim(),
+        };
+        const token = localStorage.getItem('probmail_auth_token');
+        if (token && navigator.sendBeacon) {
+          const blob = new Blob([JSON.stringify(draftPayload)], { type: 'application/json' });
+          navigator.sendBeacon(`/api/mailbox/drafts?token=${encodeURIComponent(token)}`, blob);
+        }
+      }
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [showCompose, composeTo, composeSubject, composeBody, composeDraftId]);
+
   // Filter mails
   const filteredMails = mails.filter((m) => {
     const matchesSearch =
@@ -261,6 +470,17 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
     return true;
   });
 
+  // Filter drafts
+  const filteredDrafts = drafts.filter((d) => {
+    const term = searchTerm.toLowerCase();
+    return (
+      (d.subject || '').toLowerCase().includes(term) ||
+      (d.recipientEmail || '').toLowerCase().includes(term) ||
+      (d.recipientName || '').toLowerCase().includes(term) ||
+      (d.body || '').toLowerCase().includes(term)
+    );
+  });
+
   // Unread badge counters
   const inboxUnread = mailService.getInbox(currentUser.email).filter((m) => !m.isRead).length;
   const spamCount = mailService.getSpam(currentUser.email).length;
@@ -268,7 +488,7 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
 
   return (
     <div className="flex-1 flex flex-col h-full bg-[#0B0F19] text-slate-100 font-sans overflow-hidden selection:bg-cyan-500 selection:text-black">
-      {/* SINGLE UNIFIED TOP TOOLBAR: FOLDERS, COMPOSE & FILTERS (NO SECOND SIDEBAR) */}
+      {/* SINGLE UNIFIED TOP TOOLBAR: FOLDERS, COMPOSE & FILTERS */}
       <div className="border-b border-slate-800 bg-slate-900/70 backdrop-blur px-4 sm:px-6 py-2.5 flex flex-wrap items-center justify-between gap-3 shrink-0">
         {/* Left: Compose Button + Folder Tab Pills */}
         <div className="flex items-center flex-wrap gap-2">
@@ -357,6 +577,26 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
               <Star className="w-3.5 h-3.5 text-amber-400" />
               <span>Starred</span>
             </button>
+
+            <button
+              onClick={() => {
+                setCurrentFolder('drafts');
+                setSelectedMail(null);
+              }}
+              className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
+                currentFolder === 'drafts'
+                  ? 'bg-purple-950 text-purple-300 border border-purple-800 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+              }`}
+            >
+              <FileEdit className="w-3.5 h-3.5 text-purple-400" />
+              <span>Drafts</span>
+              {drafts.length > 0 && (
+                <span className="text-[10px] px-1.5 py-0.2 rounded-full font-mono font-bold bg-purple-500/20 text-purple-300 border border-purple-700/50 ml-1">
+                  {drafts.length}
+                </span>
+              )}
+            </button>
           </div>
         </div>
 
@@ -408,19 +648,19 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
             </button>
           </div>
 
-          {/* Registered users shortcut badge */}
-          {registeredUsers.length > 0 && (
+          {/* Previous Sent Recipients shortcut badges (displayed only if user has previously sent emails) */}
+          {sentRecipients.length > 0 && (
             <div className="hidden xl:flex items-center space-x-1 pl-1">
               <span className="text-[10px] text-slate-500 font-mono">Send to:</span>
               <div className="flex items-center space-x-1">
-                {registeredUsers.slice(0, 2).map((u) => (
+                {sentRecipients.slice(0, 3).map((r) => (
                   <button
-                    key={u.id}
-                    onClick={() => handleOpenCompose(u.email, `Hello ${u.name}`)}
-                    className="text-[10px] px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-cyan-300 border border-slate-800 font-medium transition truncate max-w-[100px]"
-                    title={`Send email to ${u.name} (${u.email})`}
+                    key={r.email}
+                    onClick={() => handleOpenCompose(r.email, `Hello ${r.name || r.email.split('@')[0]}`)}
+                    className="text-[10px] px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-cyan-300 border border-slate-800 font-medium transition truncate max-w-[120px]"
+                    title={`Send email to ${r.name ? `${r.name} (${r.email})` : r.email}`}
                   >
-                    @{u.name.split(' ')[0]}
+                    @{r.name ? r.name.split(' ')[0] : r.email.split('@')[0]}
                   </button>
                 ))}
               </div>
@@ -440,13 +680,81 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
 
         {/* CONTENT AREA: SPLIT VIEW OR FOCUSED EMAIL */}
         <div className="flex-1 flex overflow-hidden">
-          {/* MAIL LIST */}
+          {/* MAIL / DRAFTS LIST */}
           <div
             className={`${
               selectedMail ? 'hidden md:flex md:w-2/5' : 'flex w-full'
             } flex-col border-r border-slate-800 overflow-y-auto`}
           >
-            {filteredMails.length === 0 ? (
+            {currentFolder === 'drafts' ? (
+              filteredDrafts.length === 0 ? (
+                <div className="flex-1 flex flex-col items-center justify-center p-8 text-center text-slate-500 space-y-3">
+                  <FileEdit className="w-12 h-12 text-slate-600 stroke-[1.5]" />
+                  <h4 className="text-sm font-semibold text-slate-400">No drafts saved</h4>
+                  <p className="text-xs text-slate-500 max-w-xs">
+                    {searchTerm
+                      ? 'No drafts matched your search query.'
+                      : 'Unsent emails are automatically saved here so you can finish and send them later.'}
+                  </p>
+                  <button
+                    onClick={() => handleOpenCompose()}
+                    className="px-4 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold transition"
+                  >
+                    Compose New Email
+                  </button>
+                </div>
+              ) : (
+                <div className="divide-y divide-slate-800/60">
+                  {filteredDrafts.map((draft) => (
+                    <div
+                      key={draft.id}
+                      onClick={() => handleOpenDraft(draft)}
+                      className="p-4 cursor-pointer transition flex items-start space-x-3 bg-slate-900/30 hover:bg-slate-800/50 group"
+                    >
+                      <div className="mt-1 text-purple-400">
+                        <FileEdit className="w-4 h-4" />
+                      </div>
+
+                      <div className="flex-1 min-w-0 space-y-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-semibold text-slate-200 truncate">
+                            {draft.recipientEmail
+                              ? `To: ${draft.recipientName ? `${draft.recipientName} (${draft.recipientEmail})` : draft.recipientEmail}`
+                              : '(No Recipient Specified)'}
+                          </span>
+                          <span className="px-2 py-0.5 rounded text-[10px] font-bold font-mono bg-purple-950/90 text-purple-300 border border-purple-800/80 shrink-0">
+                            DRAFT
+                          </span>
+                        </div>
+
+                        <div className="text-xs font-medium text-slate-100 truncate">
+                          {draft.subject || '(Draft - No Subject)'}
+                        </div>
+
+                        <p className="text-[11px] text-slate-500 truncate">
+                          {draft.body || '(Empty draft message)'}
+                        </p>
+
+                        <div className="flex items-center justify-between pt-1 text-[10px] text-slate-500 font-mono">
+                          <span>
+                            Updated {new Date(draft.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}{' '}
+                            • {new Date(draft.updatedAt).toLocaleDateString()}
+                          </span>
+
+                          <button
+                            onClick={(e) => handleDeleteDraft(draft.id, e)}
+                            className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-rose-950/80 text-slate-400 hover:text-rose-400 transition"
+                            title="Discard Draft"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )
+            ) : filteredMails.length === 0 ? (
               <div className="flex-1 flex flex-col items-center justify-center p-8 text-center text-slate-500 space-y-3">
                 <Inbox className="w-12 h-12 text-slate-600 stroke-[1.5]" />
                 <h4 className="text-sm font-semibold text-slate-400">No emails found</h4>
@@ -571,6 +879,25 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
                   </button>
 
                   <div className="flex items-center space-x-2 ml-auto">
+                    {/* Show / Hide Analysis Toggle */}
+                    <button
+                      onClick={handleToggleAnalysis}
+                      disabled={loadingAnalysis}
+                      className={`px-3 py-1.5 rounded-lg border text-xs font-semibold flex items-center space-x-1.5 transition ${
+                        showAnalysis
+                          ? 'bg-cyan-950/80 border-cyan-500/60 text-cyan-300 shadow-sm shadow-cyan-500/10'
+                          : 'bg-slate-900 border-slate-800 hover:bg-slate-800 text-slate-300 hover:text-white'
+                      }`}
+                      title={showAnalysis ? 'Hide Security Analysis Panel' : 'Show Security Analysis Panel'}
+                    >
+                      {loadingAnalysis ? (
+                        <Loader2 className="w-3.5 h-3.5 text-cyan-400 animate-spin" />
+                      ) : (
+                        <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
+                      )}
+                      <span>{loadingAnalysis ? 'Analyzing...' : showAnalysis ? 'Hide Analysis' : 'Show Analysis'}</span>
+                    </button>
+
                     {/* Mark as Spam / Ham */}
                     <button
                       onClick={() => handleToggleSpam(selectedMail.id)}
@@ -644,84 +971,39 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
                   </div>
                 </div>
 
-                {/* AI CLASSIFICATION BANNER */}
-                <div
-                  className={`p-4 rounded-xl border flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 ${
-                    selectedMail.isSpam
-                      ? 'bg-rose-950/40 border-rose-800/80 text-rose-200'
-                      : 'bg-emerald-950/40 border-emerald-800/80 text-emerald-200'
-                  }`}
-                >
-                  <div className="flex items-start space-x-3">
-                    <div
-                      className={`p-2 rounded-lg shrink-0 mt-0.5 ${
-                        selectedMail.isSpam ? 'bg-rose-900/80 text-rose-400' : 'bg-emerald-900/80 text-emerald-400'
-                      }`}
-                    >
-                      {selectedMail.isSpam ? (
-                        <ShieldAlert className="w-5 h-5" />
-                      ) : (
-                        <ShieldCheck className="w-5 h-5" />
-                      )}
-                    </div>
-                    <div className="space-y-0.5">
-                      <div className="text-xs font-bold uppercase tracking-wider font-mono">
-                        Bayesian Threat Verdict:{' '}
-                        <span
-                          className={selectedMail.isSpam ? 'text-rose-400 font-black' : 'text-emerald-400 font-black'}
-                        >
-                          {selectedMail.isSpam ? 'SPAM DETECTED' : 'SAFE / HAM'}
-                        </span>
-                      </div>
-                      <p className="text-xs text-slate-300 font-sans">
-                        {selectedMail.isSpam
-                          ? 'This email contains lexical patterns and keywords strongly characteristic of phishing, spam, or financial deception.'
-                          : 'This email is authenticated as routine communication without malicious cues or phishing indicators.'}
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center space-x-4 sm:border-l sm:border-slate-800 sm:pl-4 shrink-0 font-mono">
-                    <div className="text-left sm:text-right">
-                      <div className="text-[10px] uppercase text-slate-400">Spam Probability</div>
-                      <div className={`text-base font-extrabold ${selectedMail.isSpam ? 'text-rose-400' : 'text-emerald-400'}`}>
-                        {selectedMail.spamProbability.toFixed(1)}%
-                      </div>
-                    </div>
-                    <div className="text-left sm:text-right">
-                      <div className="text-[10px] uppercase text-slate-400">Risk Score</div>
-                      <div className={`text-base font-extrabold ${selectedMail.isSpam ? 'text-rose-400' : 'text-emerald-400'}`}>
-                        {selectedMail.riskScore} / 100
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Key Trigger Tokens if present */}
-                {selectedMail.topIndicators.length > 0 && (
-                  <div className="p-3.5 rounded-xl bg-slate-900/50 border border-slate-800 space-y-2">
-                    <div className="text-[11px] font-bold uppercase font-mono text-slate-400 flex items-center space-x-1.5">
-                      <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
-                      <span>Key Bayesian Trigger Tokens</span>
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      {selectedMail.topIndicators.map((ind, i) => (
-                        <span
-                          key={i}
-                          className={`text-xs px-2.5 py-1 rounded-lg font-mono border ${
-                            ind.impact === 'spam'
-                              ? 'bg-rose-950/60 text-rose-300 border-rose-800/60'
-                              : 'bg-emerald-950/60 text-emerald-300 border-emerald-800/60'
-                          }`}
-                        >
-                          <span className="font-semibold">{ind.token}</span>{' '}
-                          <span className="opacity-75 text-[10px]">
-                            ({ind.impact === 'spam' ? '+' : '-'}
-                            {Math.abs(ind.logOdds).toFixed(1)})
-                          </span>
-                        </span>
-                      ))}
-                    </div>
+                {/* OPTIONAL EXPANDABLE SECURITY ANALYSIS PANEL */}
+                {showAnalysis && (
+                  <div className="p-4 sm:p-5 rounded-2xl bg-slate-950/90 border border-cyan-900/40 shadow-xl animate-in fade-in duration-200">
+                    <StatisticalAnalysisView
+                      predictedClass={selectedMail.predictedClass || (selectedMail.isSpam ? 'spam' : 'ham')}
+                      confidencePercentage={selectedMail.confidence}
+                      spamProbability={selectedMail.spamProbability}
+                      hamProbability={selectedMail.hamProbability}
+                      riskScore={selectedMail.riskScore}
+                      riskLevel={selectedMail.riskLevel}
+                      explanation={selectedMail.explanation}
+                      influentialFeatures={selectedMail.topIndicators?.map((ind: any) => ({
+                        word: ind.token || ind.word,
+                        log_odds: ind.logOdds ?? ind.log_odds,
+                        impact_score: Math.abs(ind.logOdds ?? ind.log_odds ?? 0),
+                        predicted_impact: ind.impact || ind.predicted_impact,
+                        badge: (ind.impact === 'spam' || ind.predicted_impact === 'spam') ? 'danger' : 'success',
+                        chi2_score: ind.chi2Score ?? ind.chi2_score,
+                        p_value: ind.pValue ?? ind.p_value,
+                        p_value_formatted: ind.pValueFormatted ?? ind.p_value_formatted,
+                        training_association: ind.trainingAssociation ?? ind.training_association,
+                        prediction_contribution: ind.predictionContribution ?? ind.prediction_contribution,
+                        interpretation: ind.interpretation,
+                        is_significant: ind.isSignificant ?? ind.is_significant,
+                        significance_status: ind.significanceStatus ?? ind.significance_status,
+                        class_association: ind.classAssociation ?? ind.class_association,
+                      }))}
+                      warningSigns={selectedMail.flagReasons}
+                      suspiciousPhrases={selectedMail.suspiciousPhrases}
+                      detectedLinks={selectedMail.detectedLinks}
+                      chi2Summary={selectedMail.chi2Summary}
+                      compactMode={true}
+                    />
                   </div>
                 )}
 
@@ -750,11 +1032,15 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
             <div className="p-4 px-6 border-b border-slate-800 flex items-center justify-between bg-slate-950/50">
               <div className="flex items-center space-x-2">
                 <Plus className="w-4 h-4 text-cyan-400 stroke-[3]" />
-                <h3 className="text-sm font-bold text-white">Compose New Email</h3>
+                <h3 className="text-sm font-bold text-white">
+                  {composeDraftId ? 'Edit Draft' : 'Compose New Email'}
+                </h3>
               </div>
               <button
-                onClick={() => setShowCompose(false)}
+                type="button"
+                onClick={handleCloseCompose}
                 className="text-slate-400 hover:text-white transition"
+                title="Close and save draft"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -762,6 +1048,12 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
 
             {/* Modal Body / Form */}
             <form onSubmit={handleSendMail} className="p-6 space-y-4 flex-1 overflow-y-auto">
+              {draftNotice && (
+                <div className="p-2.5 rounded-xl bg-purple-950/60 border border-purple-800 text-purple-300 text-xs font-semibold flex items-center space-x-2">
+                  <CheckCircle className="w-4 h-4 text-purple-400 shrink-0" />
+                  <span>{draftNotice}</span>
+                </div>
+              )}
               {composeError && (
                 <div className="p-3 rounded-lg bg-rose-950/60 border border-rose-800 text-rose-300 text-xs">
                   {composeError}
@@ -773,36 +1065,52 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
                 </div>
               )}
 
-              {/* To / Recipient */}
-              <div className="space-y-1">
+              {/* To / Recipient input with autocomplete for past sent recipients */}
+              <div className="space-y-1 relative">
                 <label className="block text-xs font-medium text-slate-300">
                   To (Recipient Email)
                 </label>
                 <input
                   type="email"
                   required
-                  placeholder="colleague@security.org or select from below"
+                  placeholder="recipient@example.com"
                   value={composeTo}
-                  onChange={(e) => setComposeTo(e.target.value)}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setComposeTo(val);
+                    if (val.trim()) {
+                      const query = val.toLowerCase().trim();
+                      const matches = sentRecipients.filter(
+                        (r) =>
+                          r.email.toLowerCase().includes(query) ||
+                          (r.name && r.name.toLowerCase().includes(query))
+                      );
+                      setRecipientSuggestions(matches);
+                    } else {
+                      setRecipientSuggestions([]);
+                    }
+                  }}
+                  onBlur={() => {
+                    setTimeout(() => setRecipientSuggestions([]), 200);
+                  }}
                   className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white focus:outline-none focus:border-cyan-500 font-mono transition"
                 />
 
-                {/* Quick picker pills of other registered users */}
-                {registeredUsers.length > 0 && (
-                  <div className="flex flex-wrap items-center gap-1.5 pt-1">
-                    <span className="text-[10px] text-slate-500 font-mono">Registered Users:</span>
-                    {registeredUsers.map((u) => (
+                {/* Autocomplete suggestions displayed only while typing */}
+                {recipientSuggestions.length > 0 && (
+                  <div className="absolute z-20 left-0 right-0 top-full mt-1 bg-slate-950 border border-slate-700 rounded-xl shadow-xl overflow-hidden max-h-40 overflow-y-auto divide-y divide-slate-800">
+                    {recipientSuggestions.map((s) => (
                       <button
+                        key={s.email}
                         type="button"
-                        key={u.id}
-                        onClick={() => setComposeTo(u.email)}
-                        className={`text-[10px] px-2 py-0.5 rounded-full font-mono transition ${
-                          composeTo.toLowerCase() === u.email.toLowerCase()
-                            ? 'bg-cyan-500 text-slate-950 font-bold'
-                            : 'bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700'
-                        }`}
+                        onMouseDown={() => {
+                          setComposeTo(s.email);
+                          setRecipientSuggestions([]);
+                        }}
+                        className="w-full text-left px-3 py-2 text-xs hover:bg-slate-800 flex items-center justify-between transition"
                       >
-                        {u.name} ({u.email})
+                        <span className="font-semibold text-white truncate">{s.name || s.email}</span>
+                        <span className="font-mono text-slate-400 text-[11px] truncate">{s.email}</span>
                       </button>
                     ))}
                   </div>
@@ -872,13 +1180,26 @@ export const InboxPage: React.FC<InboxPageProps> = ({ currentUser, onLogout }) =
               )}
 
               {/* Action Buttons */}
-              <div className="pt-2 flex items-center justify-end space-x-3">
+              <div className="pt-2 flex items-center justify-end space-x-2.5">
                 <button
                   type="button"
-                  onClick={() => setShowCompose(false)}
+                  onClick={handleCloseCompose}
                   className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-300 transition"
                 >
                   Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleSaveDraft(false)}
+                  disabled={
+                    isSavingDraft ||
+                    (!composeTo.trim() && !composeSubject.trim() && !composeBody.trim())
+                  }
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 flex items-center space-x-1.5 transition border border-slate-700 disabled:opacity-50"
+                  title="Save as draft without sending"
+                >
+                  <FileEdit className="w-3.5 h-3.5 text-purple-400" />
+                  <span>{isSavingDraft ? 'Saving...' : 'Save Draft'}</span>
                 </button>
                 <button
                   type="submit"
