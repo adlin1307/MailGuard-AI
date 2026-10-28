@@ -17,3 +17,4 @@ for path_to_add in (str(backend_dir), str(root_dir)):
 os.environ.setdefault("FLASK_ENV", "production")
 
 from backend.app import app
+
