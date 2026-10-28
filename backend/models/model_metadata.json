@@ -1,7 +1,7 @@
 {
   "model_name": "ProbMail Multinomial Naive Bayes with Chi-Square Selection",
-  "trained_at": "2026-10-28T16:25:38.053657+00:00",
-  "duration_seconds": 0.062,
+  "trained_at": "2026-10-28T17:14:33.806444+00:00",
+  "duration_seconds": 0.063,
   "dataset_info": {
     "filename": "enron_spam_data.csv",
     "path": "/Users/adlin/Desktop/MailGuard-AI/backend/data/enron_spam_data.csv",
