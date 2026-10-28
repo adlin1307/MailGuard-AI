@@ -15,16 +15,77 @@ from typing import Dict, Any, List, Optional, Union
 from config import DB_PATH
 
 
+def _clean_postgres_url(raw_url: str) -> str:
+    """Normalizes and standardizes a PostgreSQL connection URL for DB-API compatibility."""
+    clean = raw_url.strip().strip("'\"").strip()
+    if clean.startswith("postgres://"):
+        clean = "postgresql://" + clean[len("postgres://"):]
+    # Ensure sslmode=require if connecting to remote host (e.g., Neon)
+    low = clean.lower()
+    if "sslmode=" not in low and "localhost" not in low and "127.0.0.1" not in low:
+        sep = "&" if "?" in clean else "?"
+        clean = f"{clean}{sep}sslmode=require"
+    return clean
+
+
 def _get_db_url() -> Optional[str]:
-    """Retrieves and normalizes PostgreSQL database connection string if provided."""
-    for var in ("DATABASE_URL", "POSTGRES_URL", "POSTGRES_PRISMA_URL", "POSTGRES_URL_NON_POOLING"):
+    """
+    Retrieves and normalizes PostgreSQL database connection string from environment variables.
+    Checks:
+    1. Primary candidates (DATABASE_URL, POSTGRES_URL, POSTGRES_PRISMA_URL, etc.)
+    2. Case-insensitive matches for primary candidates
+    3. Any environment variable whose value is a postgresql:// or postgres:// URI
+    4. Discrete component variables (POSTGRES_HOST, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DATABASE)
+    """
+    candidates = (
+        "DATABASE_URL",
+        "POSTGRES_URL",
+        "POSTGRES_PRISMA_URL",
+        "POSTGRES_URL_NON_POOLING",
+        "DATABASE_URL_UNPOOLED",
+        "POSTGRES_URL_NO_SSL",
+        "POSTGRESQL_URL",
+        "NEON_DATABASE_URL",
+        "NEON_URL",
+        "POSTGRES_DATABASE_URL",
+        "PGDATABASE_URL",
+        "DB_URL",
+        "PG_URL"
+    )
+
+    # 1. Direct variable lookup
+    for var in candidates:
         val = os.environ.get(var)
+        if val and isinstance(val, str) and val.strip():
+            return _clean_postgres_url(val)
+
+    # 2. Case-insensitive search over environment keys
+    env_lower = {k.lower(): v for k, v in os.environ.items() if v and isinstance(v, str)}
+    for var in candidates:
+        val = env_lower.get(var.lower())
         if val and val.strip():
-            clean = val.strip()
-            # Standardize scheme for psycopg2 compatibility
-            if clean.startswith("postgres://"):
-                clean = "postgresql://" + clean[len("postgres://"):]
-            return clean
+            return _clean_postgres_url(val)
+
+    # 3. Value-based detection for any PostgreSQL URI
+    for k, v in os.environ.items():
+        if isinstance(v, str):
+            clean_v = v.strip().strip("'\"").strip()
+            if clean_v.startswith("postgres://") or clean_v.startswith("postgresql://"):
+                return _clean_postgres_url(clean_v)
+
+    # 4. Assemble from discrete host/user/password/database components
+    host = os.environ.get("POSTGRES_HOST") or os.environ.get("PGHOST") or env_lower.get("postgres_host") or env_lower.get("pghost")
+    user = os.environ.get("POSTGRES_USER") or os.environ.get("PGUSER") or env_lower.get("postgres_user") or env_lower.get("pguser")
+    password = os.environ.get("POSTGRES_PASSWORD") or os.environ.get("PGPASSWORD") or env_lower.get("postgres_password") or env_lower.get("pgpassword") or ""
+    database = os.environ.get("POSTGRES_DATABASE") or os.environ.get("PGDATABASE") or env_lower.get("postgres_database") or env_lower.get("pgdatabase") or "neondb"
+    port = os.environ.get("POSTGRES_PORT") or os.environ.get("PGPORT") or env_lower.get("postgres_port") or env_lower.get("pgport") or "5432"
+
+    if host and user:
+        from urllib.parse import quote_plus
+        esc_user = quote_plus(user.strip())
+        esc_pass = quote_plus(password.strip())
+        return f"postgresql://{esc_user}:{esc_pass}@{host.strip()}:{port.strip()}/{database.strip()}?sslmode=require"
+
     return None
 
 
@@ -45,7 +106,7 @@ def _is_postgres_active(target_db: Optional[str] = None) -> bool:
 
 
 def _get_sqlite_path(target_db: Optional[str] = None) -> Path:
-    """Resolves SQLite database path safely, falling back to /tmp if filesystem is read-only."""
+    """Resolves SQLite database path safely, falling back to /tmp if filesystem is read-only or on serverless."""
     if target_db:
         return Path(target_db)
     test_env = os.environ.get("TEST_DB_PATH")
@@ -62,8 +123,18 @@ def _get_sqlite_path(target_db: Optional[str] = None) -> Path:
     except Exception:
         pass
 
+    # Check if running in a serverless environment (Vercel, AWS Lambda)
+    is_serverless = bool(
+        os.environ.get("VERCEL")
+        or os.environ.get("VERCEL_ENV")
+        or os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+        or os.environ.get("LAMBDA_TASK_ROOT")
+    )
+    if is_serverless:
+        return Path("/tmp") / "probmail.db"
+
     db_file = DB_PATH
-    # Check if target directory is writable (e.g. AWS Lambda / Vercel Serverless /var/task is read-only)
+    # Check if target directory is writable
     try:
         db_file.parent.mkdir(parents=True, exist_ok=True)
         probe = db_file.parent / ".perm_check"
@@ -75,11 +146,27 @@ def _get_sqlite_path(target_db: Optional[str] = None) -> Path:
         return Path("/tmp") / "probmail.db"
 
 
+class RowDict(dict):
+    """
+    Standardized row dictionary providing both named dictionary access and integer indexing.
+    Ensures identical row access semantics across SQLite, psycopg2 DictRow, and pg8000.
+    """
+    def __init__(self, cols: List[str], vals: Union[tuple, list]):
+        super().__init__(zip(cols, vals))
+        self._vals = list(vals)
+
+    def __getitem__(self, item):
+        if isinstance(item, int):
+            return self._vals[item]
+        return super().__getitem__(item)
+
+
 class CursorWrapper:
     """Cursor wrapper standardizing parameter placeholder syntax and row access."""
-    def __init__(self, raw_cursor, is_postgres: bool):
+    def __init__(self, raw_cursor, is_postgres: bool, driver: str = "sqlite"):
         self.cursor = raw_cursor
         self.is_postgres = is_postgres
+        self.driver = driver
         self.last_inserted_id = None
 
     def execute(self, query: str, params: Optional[Union[tuple, list]] = None):
@@ -96,15 +183,28 @@ class CursorWrapper:
                 self.cursor.execute(query, params)
         return self
 
+    def _wrap_row(self, row):
+        if row is None:
+            return None
+        if self.driver == "pg8000" and getattr(self.cursor, "description", None):
+            cols = [col[0] for col in self.cursor.description]
+            return RowDict(cols, row)
+        return row
+
     def fetchone(self):
-        return self.cursor.fetchone()
+        row = self.cursor.fetchone()
+        return self._wrap_row(row)
 
     def fetchall(self):
-        return self.cursor.fetchall()
+        rows = self.cursor.fetchall()
+        if self.driver == "pg8000" and getattr(self.cursor, "description", None):
+            cols = [col[0] for col in self.cursor.description]
+            return [RowDict(cols, r) for r in rows]
+        return rows
 
     @property
     def rowcount(self):
-        return self.cursor.rowcount
+        return getattr(self.cursor, "rowcount", -1)
 
     @property
     def lastrowid(self):
@@ -113,7 +213,12 @@ class CursorWrapper:
         return getattr(self.cursor, "lastrowid", None)
 
     def __iter__(self):
-        return iter(self.cursor)
+        if self.driver == "pg8000" and getattr(self.cursor, "description", None):
+            cols = [col[0] for col in self.cursor.description]
+            for row in self.cursor:
+                yield RowDict(cols, row)
+        else:
+            yield from iter(self.cursor)
 
     def __enter__(self):
         return self
@@ -127,17 +232,24 @@ class CursorWrapper:
 
 class DBConnectionWrapper:
     """Connection wrapper managing transactions and safe connection closure."""
-    def __init__(self, raw_conn, is_postgres: bool):
+    def __init__(self, raw_conn, is_postgres: bool, driver: str = "sqlite"):
         self.raw_conn = raw_conn
         self.is_postgres = is_postgres
+        self.driver = driver
         self.closed = False
 
     def cursor(self):
         if self.is_postgres:
-            import psycopg2.extras
-            return CursorWrapper(self.raw_conn.cursor(cursor_factory=psycopg2.extras.DictCursor), is_postgres=True)
+            if self.driver == "psycopg2":
+                try:
+                    import psycopg2.extras
+                    return CursorWrapper(self.raw_conn.cursor(cursor_factory=psycopg2.extras.DictCursor), is_postgres=True, driver="psycopg2")
+                except Exception:
+                    return CursorWrapper(self.raw_conn.cursor(), is_postgres=True, driver="psycopg2")
+            else:
+                return CursorWrapper(self.raw_conn.cursor(), is_postgres=True, driver="pg8000")
         else:
-            return CursorWrapper(self.raw_conn.cursor(), is_postgres=False)
+            return CursorWrapper(self.raw_conn.cursor(), is_postgres=False, driver="sqlite")
 
     def commit(self):
         try:
@@ -172,10 +284,15 @@ class DBConnectionWrapper:
             self.close()
 
 
-def _create_raw_connection(target_db: Optional[str] = None):
-    """Establishes connection to PostgreSQL or SQLite based on configuration."""
-    if _is_postgres_active(target_db):
-        url = _get_db_url()
+def _connect_postgres(url: str):
+    """
+    Establishes connection to PostgreSQL using psycopg2 if available,
+    falling back seamlessly to pure-Python pg8000.
+    """
+    last_err = None
+
+    # Attempt 1: psycopg2
+    try:
         import psycopg2
         import psycopg2.extras
 
@@ -183,27 +300,99 @@ def _create_raw_connection(target_db: Optional[str] = None):
         if "sslmode=" not in url.lower() and "localhost" not in url.lower() and "127.0.0.1" not in url.lower():
             conn_kwargs["sslmode"] = "require"
 
-        last_err = None
         for attempt in range(3):
             try:
-                raw_conn = psycopg2.connect(url, **conn_kwargs)
-                raw_conn.autocommit = False
-                return raw_conn, True
+                conn = psycopg2.connect(url, **conn_kwargs)
+                conn.autocommit = False
+                return conn, "psycopg2"
             except Exception as e:
                 last_err = e
-                time.sleep(0.5 * (attempt + 1))
-        raise last_err or RuntimeError("Failed to connect to PostgreSQL database.")
+                time.sleep(0.4 * (attempt + 1))
+    except (ImportError, Exception) as e:
+        last_err = e
+
+    # Attempt 2: pg8000 (pure-Python DB-API 2.0 driver, zero C dependencies)
+    try:
+        import pg8000.dbapi
+        import ssl
+        from urllib.parse import urlparse, unquote
+
+        parsed = urlparse(url)
+        user = unquote(parsed.username or "")
+        password = unquote(parsed.password or "")
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 5432
+        database = parsed.path.lstrip("/") or "neondb"
+
+        ssl_ctx = None
+        if "localhost" not in host and "127.0.0.1" not in host:
+            ssl_ctx = ssl.create_default_context()
+
+        for attempt in range(3):
+            try:
+                conn = pg8000.dbapi.connect(
+                    user=user,
+                    password=password,
+                    host=host,
+                    port=port,
+                    database=database,
+                    ssl_context=ssl_ctx
+                )
+                conn.autocommit = False
+                return conn, "pg8000"
+            except Exception as e:
+                last_err = e
+                time.sleep(0.4 * (attempt + 1))
+    except (ImportError, Exception) as e:
+        last_err = e
+
+    raise last_err or RuntimeError("Failed to connect to PostgreSQL database via psycopg2 or pg8000.")
+
+
+def _create_raw_connection(target_db: Optional[str] = None):
+    """Establishes connection to PostgreSQL or SQLite based on configuration."""
+    if _is_postgres_active(target_db):
+        url = _get_db_url()
+        raw_conn, driver = _connect_postgres(url)
+        return raw_conn, True, driver
     else:
         db_file = _get_sqlite_path(target_db)
-        raw_conn = sqlite3.connect(str(db_file))
+        try:
+            raw_conn = sqlite3.connect(str(db_file))
+        except sqlite3.OperationalError:
+            fallback_path = Path("/tmp") / "probmail.db"
+            raw_conn = sqlite3.connect(str(fallback_path))
         raw_conn.row_factory = sqlite3.Row
-        return raw_conn, False
+        return raw_conn, False, "sqlite"
 
 
 def get_connection(target_db: Optional[str] = None) -> DBConnectionWrapper:
     """Returns a managed database connection wrapper supporting context manager usage."""
-    raw_conn, is_postgres = _create_raw_connection(target_db)
-    return DBConnectionWrapper(raw_conn, is_postgres)
+    res = _create_raw_connection(target_db)
+    if len(res) == 3:
+        raw_conn, is_postgres, driver = res
+    else:
+        raw_conn, is_postgres = res
+        driver = "psycopg2" if is_postgres else "sqlite"
+    return DBConnectionWrapper(raw_conn, is_postgres, driver)
+
+
+def log_db_diagnostics():
+    """Prints diagnostic information about database configuration without printing secrets."""
+    is_serverless = bool(
+        os.environ.get("VERCEL")
+        or os.environ.get("VERCEL_ENV")
+        or os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+        or os.environ.get("LAMBDA_TASK_ROOT")
+    )
+    if is_serverless or os.environ.get("DEBUG_DB"):
+        pg_active = _is_postgres_active()
+        db_keys = [k for k in os.environ if any(w in k.upper() for w in ("DATABASE", "POSTGRES", "PG", "NEON", "DB"))]
+        masked_keys = sorted(db_keys)
+        print(
+            f"[ProbMail DB Diagnostics] Serverless: {is_serverless} | PostgreSQL active: {pg_active} | DB env keys present: {masked_keys}",
+            file=sys.stderr
+        )
 
 
 def init_db(target_db: Optional[str] = None):
@@ -212,7 +401,8 @@ def init_db(target_db: Optional[str] = None):
         cursor = conn.cursor()
         if conn.is_postgres:
             # PostgreSQL Schema
-            cursor.execute("""
+            pg_ddl_statements = [
+                """
                 CREATE TABLE IF NOT EXISTS predictions (
                     id SERIAL PRIMARY KEY,
                     subject TEXT,
@@ -224,7 +414,9 @@ def init_db(target_db: Optional[str] = None):
                     ham_probability REAL,
                     risk_score INTEGER,
                     owner_id TEXT
-                );
+                )
+                """,
+                """
                 CREATE TABLE IF NOT EXISTS users (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -233,7 +425,9 @@ def init_db(target_db: Optional[str] = None):
                     salt TEXT NOT NULL,
                     role TEXT DEFAULT 'SecOps Analyst',
                     created_at TEXT NOT NULL
-                );
+                )
+                """,
+                """
                 CREATE TABLE IF NOT EXISTS mailbox_messages (
                     id TEXT PRIMARY KEY,
                     sender_id TEXT NOT NULL,
@@ -254,7 +448,9 @@ def init_db(target_db: Optional[str] = None):
                     spam_probability REAL,
                     ham_probability REAL,
                     analysis_json TEXT
-                );
+                )
+                """,
+                """
                 CREATE TABLE IF NOT EXISTS drafts (
                     id TEXT PRIMARY KEY,
                     user_id TEXT NOT NULL,
@@ -263,7 +459,9 @@ def init_db(target_db: Optional[str] = None):
                     subject TEXT,
                     body TEXT,
                     updated_at TEXT NOT NULL
-                );
+                )
+                """,
+                """
                 CREATE TABLE IF NOT EXISTS training_history (
                     id SERIAL PRIMARY KEY,
                     trained_at TEXT NOT NULL,
@@ -274,13 +472,16 @@ def init_db(target_db: Optional[str] = None):
                     train_samples INTEGER,
                     test_samples INTEGER,
                     k_features INTEGER
-                );
-                CREATE INDEX IF NOT EXISTS idx_predictions_owner ON predictions (owner_id);
-                CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
-                CREATE INDEX IF NOT EXISTS idx_mailbox_recipient ON mailbox_messages (recipient_email);
-                CREATE INDEX IF NOT EXISTS idx_mailbox_sender ON mailbox_messages (sender_id);
-                CREATE INDEX IF NOT EXISTS idx_drafts_user ON drafts (user_id);
-            """)
+                )
+                """,
+                "CREATE INDEX IF NOT EXISTS idx_predictions_owner ON predictions (owner_id)",
+                "CREATE INDEX IF NOT EXISTS idx_users_email ON users (email)",
+                "CREATE INDEX IF NOT EXISTS idx_mailbox_recipient ON mailbox_messages (recipient_email)",
+                "CREATE INDEX IF NOT EXISTS idx_mailbox_sender ON mailbox_messages (sender_id)",
+                "CREATE INDEX IF NOT EXISTS idx_drafts_user ON drafts (user_id)"
+            ]
+            for stmt in pg_ddl_statements:
+                cursor.execute(stmt.strip())
 
             # Safe column migrations if existing tables were initialized with earlier revisions
             for col, col_type in [

@@ -45,14 +45,19 @@ def create_app() -> Flask:
         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"]
     )
 
-    # Initialize SQLite database schema
-    init_db()
+    # Initialize database schema
+    try:
+        from services.db import log_db_diagnostics
+        log_db_diagnostics()
+        init_db()
+    except Exception as e:
+        print(f"[ProbMail Startup] Database initialization warning: {e}", file=sys.stderr)
 
     # Automatically ensure primary model is trained and ready
     try:
         ensure_trained_model()
     except Exception as e:
-        print(f"[ProbMail Startup] Note: Background model check: {e}")
+        print(f"[ProbMail Startup] Note: Background model check: {e}", file=sys.stderr)
 
     # Register API Blueprints under /api prefix
     app.register_blueprint(health_bp, url_prefix="/api")

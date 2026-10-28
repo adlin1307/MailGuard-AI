@@ -18,3 +18,6 @@ os.environ.setdefault("FLASK_ENV", "production")
 
 from backend.app import app
 
+# Standard Vercel Serverless Function WSGI export
+handler = app
+

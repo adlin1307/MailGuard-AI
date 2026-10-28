@@ -27,7 +27,7 @@ def test_get_db_url_standardization():
 
     with patch.dict(os.environ, {"POSTGRES_URL": "postgresql://user:pass@ep-xyz.neon.tech/neondb"}):
         url = _get_db_url()
-        assert url == "postgresql://user:pass@ep-xyz.neon.tech/neondb"
+        assert url == "postgresql://user:pass@ep-xyz.neon.tech/neondb?sslmode=require"
 
 
 def test_is_postgres_active_behavior():
@@ -147,3 +147,51 @@ def test_postgres_save_draft_on_conflict():
     sql_query = mock_cur.execute.call_args[0][0]
     assert "ON CONFLICT(id) DO UPDATE SET" in sql_query
     assert "EXCLUDED.recipient_email" in sql_query
+
+
+def test_get_db_url_component_variables():
+    """Verifies that discrete POSTGRES_HOST / POSTGRES_USER variables are assembled into a valid URL."""
+    env = {
+        "POSTGRES_HOST": "ep-cool-db.us-east-2.aws.neon.tech",
+        "POSTGRES_USER": "test_user",
+        "POSTGRES_PASSWORD": "secret_password",
+        "POSTGRES_DATABASE": "mailguard_db",
+        "POSTGRES_PORT": "5432"
+    }
+    with patch.dict(os.environ, env, clear=True):
+        url = _get_db_url()
+        assert url is not None
+        assert "postgresql://test_user:secret_password@ep-cool-db.us-east-2.aws.neon.tech:5432/mailguard_db" in url
+        assert "sslmode=require" in url
+
+
+def test_get_db_url_value_scan_and_quotes():
+    """Verifies that URLs wrapped in quotes or stored in custom variable names are found."""
+    env = {
+        "CUSTOM_APP_NEON_URI": "  \"postgres://usr:pwd@neon.tech/appdb\"  "
+    }
+    with patch.dict(os.environ, env, clear=True):
+        url = _get_db_url()
+        assert url is not None
+        assert url.startswith("postgresql://usr:pwd@neon.tech/appdb")
+        assert "sslmode=require" in url
+
+
+def test_serverless_sqlite_tmp_resolution():
+    """Verifies that when running on Vercel, SQLite always resolves to /tmp/probmail.db."""
+    with patch.dict(os.environ, {"VERCEL": "1"}, clear=True):
+        path = _get_sqlite_path()
+        assert path == Path("/tmp/probmail.db")
+
+
+def test_row_dict_compatibility():
+    """Verifies that RowDict supports integer indexing, named access, and dict conversion."""
+    from services.db import RowDict
+    row = RowDict(["id", "subject", "score"], [101, "Suspicious Invoice", 92.5])
+    assert row[0] == 101
+    assert row["subject"] == "Suspicious Invoice"
+    assert row["score"] == 92.5
+    d = dict(row)
+    assert d == {"id": 101, "subject": "Suspicious Invoice", "score": 92.5}
+    assert set(row.keys()) == {"id", "subject", "score"}
+
