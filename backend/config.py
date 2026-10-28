@@ -14,8 +14,11 @@ PRIMARY_DATASET_FILENAME = "enron_spam_data.csv"
 SAMPLE_DATASET_PATH = BASE_DIR / "data" / "sample_dataset.csv"
 
 # Ensure directories exist
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
 
 def resolve_dataset_path(filename: str = PRIMARY_DATASET_FILENAME) -> Optional[Path]:
     """

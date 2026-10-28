@@ -28,14 +28,22 @@ from routes.mailbox import mailbox_bp
 
 
 def create_app() -> Flask:
-    frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+    frontend_dist = Path(__file__).resolve().parent.parent / "dist"
+    if not frontend_dist.exists():
+        frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
     static_folder = str(frontend_dist) if frontend_dist.exists() else None
 
     app = Flask(__name__, static_folder=static_folder)
     app.config["SECRET_KEY"] = SECRET_KEY
 
     # Enable CORS for all origins on API routes with exposed headers for file downloads
-    CORS(app, resources={r"/api/*": {"origins": "*"}}, expose_headers=["Content-Disposition", "Content-Type", "Content-Length"])
+    CORS(
+        app,
+        resources={r"/api/*": {"origins": "*"}},
+        expose_headers=["Content-Disposition", "Content-Type", "Content-Length"],
+        allow_headers=["Content-Type", "Authorization", "X-ProbMail-Token", "X-Requested-With"],
+        methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    )
 
     # Initialize SQLite database schema
     init_db()

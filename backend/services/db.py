@@ -1,149 +1,404 @@
 """
 Database Persistence Layer for ProbMail.
-Uses SQLite for storing prediction audit logs and model evaluation runs securely.
+Supports PostgreSQL (Neon, Supabase, RDS via DATABASE_URL/POSTGRES_URL)
+and SQLite (for local development and isolated automated pytest suites).
 Avoids storing sensitive raw email bodies while keeping snippets for audit verification.
 """
 import sqlite3
 import os
+import sys
+import time
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 from config import DB_PATH
 
 
-def get_connection(target_db: Optional[str] = None) -> sqlite3.Connection:
-    """Returns a SQLite connection with dict row factory, supporting test runner isolation."""
+def _get_db_url() -> Optional[str]:
+    """Retrieves and normalizes PostgreSQL database connection string if provided."""
+    for var in ("DATABASE_URL", "POSTGRES_URL", "POSTGRES_PRISMA_URL", "POSTGRES_URL_NON_POOLING"):
+        val = os.environ.get(var)
+        if val and val.strip():
+            clean = val.strip()
+            # Standardize scheme for psycopg2 compatibility
+            if clean.startswith("postgres://"):
+                clean = "postgresql://" + clean[len("postgres://"):]
+            return clean
+    return None
+
+
+def _is_postgres_active(target_db: Optional[str] = None) -> bool:
+    """Determines whether PostgreSQL should be used for database operations."""
     if target_db:
-        db_file = target_db
-    else:
-        test_env = os.environ.get("TEST_DB_PATH")
-        if test_env:
-            db_file = Path(test_env)
+        return False
+    if os.environ.get("TEST_DB_PATH"):
+        return False
+    try:
+        from flask import current_app
+        if current_app and (current_app.config.get("TESTING") or current_app.config.get("TEST_DB_PATH")):
+            return False
+    except Exception:
+        pass
+    url = _get_db_url()
+    return bool(url)
+
+
+def _get_sqlite_path(target_db: Optional[str] = None) -> Path:
+    """Resolves SQLite database path safely, falling back to /tmp if filesystem is read-only."""
+    if target_db:
+        return Path(target_db)
+    test_env = os.environ.get("TEST_DB_PATH")
+    if test_env:
+        return Path(test_env)
+    try:
+        from flask import current_app
+        if current_app:
+            if current_app.config.get("TEST_DB_PATH"):
+                return Path(current_app.config["TEST_DB_PATH"])
+            elif current_app.config.get("TESTING"):
+                from config import BASE_DIR
+                return BASE_DIR / "test_probmail.db"
+    except Exception:
+        pass
+
+    db_file = DB_PATH
+    # Check if target directory is writable (e.g. AWS Lambda / Vercel Serverless /var/task is read-only)
+    try:
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+        probe = db_file.parent / ".perm_check"
+        probe.touch()
+        probe.unlink()
+        return db_file
+    except (OSError, PermissionError):
+        # Fall back to writable /tmp directory
+        return Path("/tmp") / "probmail.db"
+
+
+class CursorWrapper:
+    """Cursor wrapper standardizing parameter placeholder syntax and row access."""
+    def __init__(self, raw_cursor, is_postgres: bool):
+        self.cursor = raw_cursor
+        self.is_postgres = is_postgres
+        self.last_inserted_id = None
+
+    def execute(self, query: str, params: Optional[Union[tuple, list]] = None):
+        if self.is_postgres:
+            pg_query = query.replace("?", "%s")
+            if params is None:
+                self.cursor.execute(pg_query)
+            else:
+                self.cursor.execute(pg_query, params)
         else:
-            db_file = DB_PATH
+            if params is None:
+                self.cursor.execute(query)
+            else:
+                self.cursor.execute(query, params)
+        return self
+
+    def fetchone(self):
+        return self.cursor.fetchone()
+
+    def fetchall(self):
+        return self.cursor.fetchall()
+
+    @property
+    def rowcount(self):
+        return self.cursor.rowcount
+
+    @property
+    def lastrowid(self):
+        if self.is_postgres:
+            return self.last_inserted_id
+        return getattr(self.cursor, "lastrowid", None)
+
+    def __iter__(self):
+        return iter(self.cursor)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            self.cursor.close()
+        except Exception:
+            pass
+
+
+class DBConnectionWrapper:
+    """Connection wrapper managing transactions and safe connection closure."""
+    def __init__(self, raw_conn, is_postgres: bool):
+        self.raw_conn = raw_conn
+        self.is_postgres = is_postgres
+        self.closed = False
+
+    def cursor(self):
+        if self.is_postgres:
+            import psycopg2.extras
+            return CursorWrapper(self.raw_conn.cursor(cursor_factory=psycopg2.extras.DictCursor), is_postgres=True)
+        else:
+            return CursorWrapper(self.raw_conn.cursor(), is_postgres=False)
+
+    def commit(self):
+        try:
+            self.raw_conn.commit()
+        except Exception:
+            pass
+
+    def rollback(self):
+        try:
+            self.raw_conn.rollback()
+        except Exception:
+            pass
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
             try:
-                from flask import current_app
-                if current_app:
-                    if current_app.config.get("TEST_DB_PATH"):
-                        db_file = current_app.config["TEST_DB_PATH"]
-                    elif current_app.config.get("TESTING"):
-                        from config import BASE_DIR
-                        db_file = BASE_DIR / "test_probmail.db"
+                self.raw_conn.close()
             except Exception:
                 pass
-    conn = sqlite3.connect(str(db_file))
-    conn.row_factory = sqlite3.Row
-    return conn
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if exc_type is None:
+                self.commit()
+            else:
+                self.rollback()
+        finally:
+            self.close()
+
+
+def _create_raw_connection(target_db: Optional[str] = None):
+    """Establishes connection to PostgreSQL or SQLite based on configuration."""
+    if _is_postgres_active(target_db):
+        url = _get_db_url()
+        import psycopg2
+        import psycopg2.extras
+
+        conn_kwargs = {}
+        if "sslmode=" not in url.lower() and "localhost" not in url.lower() and "127.0.0.1" not in url.lower():
+            conn_kwargs["sslmode"] = "require"
+
+        last_err = None
+        for attempt in range(3):
+            try:
+                raw_conn = psycopg2.connect(url, **conn_kwargs)
+                raw_conn.autocommit = False
+                return raw_conn, True
+            except Exception as e:
+                last_err = e
+                time.sleep(0.5 * (attempt + 1))
+        raise last_err or RuntimeError("Failed to connect to PostgreSQL database.")
+    else:
+        db_file = _get_sqlite_path(target_db)
+        raw_conn = sqlite3.connect(str(db_file))
+        raw_conn.row_factory = sqlite3.Row
+        return raw_conn, False
+
+
+def get_connection(target_db: Optional[str] = None) -> DBConnectionWrapper:
+    """Returns a managed database connection wrapper supporting context manager usage."""
+    raw_conn, is_postgres = _create_raw_connection(target_db)
+    return DBConnectionWrapper(raw_conn, is_postgres)
 
 
 def init_db(target_db: Optional[str] = None):
-    """Initializes tables for predictions, users, mailbox, and training audit log safely."""
+    """Initializes schema for predictions, users, mailbox, and training audit log."""
     with get_connection(target_db) as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS predictions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                subject TEXT,
-                snippet TEXT,
-                predicted_class TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                timestamp TEXT NOT NULL,
-                spam_probability REAL,
-                ham_probability REAL,
-                risk_score INTEGER,
-                owner_id TEXT
-            )
-        """)
+        if conn.is_postgres:
+            # PostgreSQL Schema
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS predictions (
+                    id SERIAL PRIMARY KEY,
+                    subject TEXT,
+                    snippet TEXT,
+                    predicted_class TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    spam_probability REAL,
+                    ham_probability REAL,
+                    risk_score INTEGER,
+                    owner_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS users (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    email TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    salt TEXT NOT NULL,
+                    role TEXT DEFAULT 'SecOps Analyst',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS mailbox_messages (
+                    id TEXT PRIMARY KEY,
+                    sender_id TEXT NOT NULL,
+                    sender_email TEXT NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    recipient_email TEXT NOT NULL,
+                    recipient_name TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    is_read INTEGER DEFAULT 0,
+                    starred INTEGER DEFAULT 0,
+                    is_spam INTEGER DEFAULT 0,
+                    predicted_class TEXT DEFAULT 'ham',
+                    confidence REAL DEFAULT 95.0,
+                    risk_score INTEGER DEFAULT 0,
+                    risk_level TEXT DEFAULT 'low',
+                    spam_probability REAL,
+                    ham_probability REAL,
+                    analysis_json TEXT
+                );
+                CREATE TABLE IF NOT EXISTS drafts (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    recipient_email TEXT,
+                    recipient_name TEXT,
+                    subject TEXT,
+                    body TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS training_history (
+                    id SERIAL PRIMARY KEY,
+                    trained_at TEXT NOT NULL,
+                    accuracy REAL NOT NULL,
+                    precision REAL,
+                    recall REAL,
+                    f1_score REAL NOT NULL,
+                    train_samples INTEGER,
+                    test_samples INTEGER,
+                    k_features INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_predictions_owner ON predictions (owner_id);
+                CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
+                CREATE INDEX IF NOT EXISTS idx_mailbox_recipient ON mailbox_messages (recipient_email);
+                CREATE INDEX IF NOT EXISTS idx_mailbox_sender ON mailbox_messages (sender_id);
+                CREATE INDEX IF NOT EXISTS idx_drafts_user ON drafts (user_id);
+            """)
 
-        # Safely migrate existing tables if columns are missing
-        cursor.execute("PRAGMA table_info(predictions)")
-        existing_cols = {row[1] for row in cursor.fetchall()}
-        if "spam_probability" not in existing_cols:
-            cursor.execute("ALTER TABLE predictions ADD COLUMN spam_probability REAL")
-        if "ham_probability" not in existing_cols:
-            cursor.execute("ALTER TABLE predictions ADD COLUMN ham_probability REAL")
-        if "risk_score" not in existing_cols:
-            cursor.execute("ALTER TABLE predictions ADD COLUMN risk_score INTEGER")
-        if "owner_id" not in existing_cols:
-            cursor.execute("ALTER TABLE predictions ADD COLUMN owner_id TEXT")
+            # Safe column migrations if existing tables were initialized with earlier revisions
+            for col, col_type in [
+                ("spam_probability", "REAL"),
+                ("ham_probability", "REAL"),
+                ("risk_score", "INTEGER"),
+                ("owner_id", "TEXT"),
+            ]:
+                cursor.execute(f"ALTER TABLE predictions ADD COLUMN IF NOT EXISTS {col} {col_type}")
 
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_predictions_owner ON predictions (owner_id)")
+            for col, col_type in [
+                ("spam_probability", "REAL"),
+                ("ham_probability", "REAL"),
+                ("analysis_json", "TEXT"),
+            ]:
+                cursor.execute(f"ALTER TABLE mailbox_messages ADD COLUMN IF NOT EXISTS {col} {col_type}")
 
-        # Users table for authenticated credentials verification
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                salt TEXT NOT NULL,
-                role TEXT DEFAULT 'SecOps Analyst',
-                created_at TEXT NOT NULL
-            )
-        """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users (email)")
+        else:
+            # SQLite Schema
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS predictions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subject TEXT,
+                    snippet TEXT,
+                    predicted_class TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    spam_probability REAL,
+                    ham_probability REAL,
+                    risk_score INTEGER,
+                    owner_id TEXT
+                )
+            """)
 
-        # Shared Backend Mailbox Messages table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS mailbox_messages (
-                id TEXT PRIMARY KEY,
-                sender_id TEXT NOT NULL,
-                sender_email TEXT NOT NULL,
-                sender_name TEXT NOT NULL,
-                recipient_email TEXT NOT NULL,
-                recipient_name TEXT NOT NULL,
-                subject TEXT NOT NULL,
-                body TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                is_read INTEGER DEFAULT 0,
-                starred INTEGER DEFAULT 0,
-                is_spam INTEGER DEFAULT 0,
-                predicted_class TEXT DEFAULT 'ham',
-                confidence REAL DEFAULT 95.0,
-                risk_score INTEGER DEFAULT 0,
-                risk_level TEXT DEFAULT 'low'
-            )
-        """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_recipient ON mailbox_messages (recipient_email)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_sender ON mailbox_messages (sender_id)")
+            cursor.execute("PRAGMA table_info(predictions)")
+            existing_cols = {row[1] for row in cursor.fetchall()}
+            if "spam_probability" not in existing_cols:
+                cursor.execute("ALTER TABLE predictions ADD COLUMN spam_probability REAL")
+            if "ham_probability" not in existing_cols:
+                cursor.execute("ALTER TABLE predictions ADD COLUMN ham_probability REAL")
+            if "risk_score" not in existing_cols:
+                cursor.execute("ALTER TABLE predictions ADD COLUMN risk_score INTEGER")
+            if "owner_id" not in existing_cols:
+                cursor.execute("ALTER TABLE predictions ADD COLUMN owner_id TEXT")
 
-        # Safely migrate mailbox_messages if analysis columns are missing
-        cursor.execute("PRAGMA table_info(mailbox_messages)")
-        mb_cols = {row[1] for row in cursor.fetchall()}
-        if "spam_probability" not in mb_cols:
-            cursor.execute("ALTER TABLE mailbox_messages ADD COLUMN spam_probability REAL")
-        if "ham_probability" not in mb_cols:
-            cursor.execute("ALTER TABLE mailbox_messages ADD COLUMN ham_probability REAL")
-        if "analysis_json" not in mb_cols:
-            cursor.execute("ALTER TABLE mailbox_messages ADD COLUMN analysis_json TEXT")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_predictions_owner ON predictions (owner_id)")
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS drafts (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                recipient_email TEXT,
-                recipient_name TEXT,
-                subject TEXT,
-                body TEXT,
-                updated_at TEXT NOT NULL
-            )
-        """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_drafts_user ON drafts (user_id)")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    email TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    salt TEXT NOT NULL,
+                    role TEXT DEFAULT 'SecOps Analyst',
+                    created_at TEXT NOT NULL
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users (email)")
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS training_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                trained_at TEXT NOT NULL,
-                accuracy REAL NOT NULL,
-                precision REAL,
-                recall REAL,
-                f1_score REAL NOT NULL,
-                train_samples INTEGER,
-                test_samples INTEGER,
-                k_features INTEGER
-            )
-        """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS mailbox_messages (
+                    id TEXT PRIMARY KEY,
+                    sender_id TEXT NOT NULL,
+                    sender_email TEXT NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    recipient_email TEXT NOT NULL,
+                    recipient_name TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    is_read INTEGER DEFAULT 0,
+                    starred INTEGER DEFAULT 0,
+                    is_spam INTEGER DEFAULT 0,
+                    predicted_class TEXT DEFAULT 'ham',
+                    confidence REAL DEFAULT 95.0,
+                    risk_score INTEGER DEFAULT 0,
+                    risk_level TEXT DEFAULT 'low'
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_recipient ON mailbox_messages (recipient_email)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_sender ON mailbox_messages (sender_id)")
+
+            cursor.execute("PRAGMA table_info(mailbox_messages)")
+            mb_cols = {row[1] for row in cursor.fetchall()}
+            if "spam_probability" not in mb_cols:
+                cursor.execute("ALTER TABLE mailbox_messages ADD COLUMN spam_probability REAL")
+            if "ham_probability" not in mb_cols:
+                cursor.execute("ALTER TABLE mailbox_messages ADD COLUMN ham_probability REAL")
+            if "analysis_json" not in mb_cols:
+                cursor.execute("ALTER TABLE mailbox_messages ADD COLUMN analysis_json TEXT")
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS drafts (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    recipient_email TEXT,
+                    recipient_name TEXT,
+                    subject TEXT,
+                    body TEXT,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_drafts_user ON drafts (user_id)")
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS training_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trained_at TEXT NOT NULL,
+                    accuracy REAL NOT NULL,
+                    precision REAL,
+                    recall REAL,
+                    f1_score REAL NOT NULL,
+                    train_samples INTEGER,
+                    test_samples INTEGER,
+                    k_features INTEGER
+                )
+            """)
         conn.commit()
 
 
@@ -167,7 +422,6 @@ def save_prediction(
     clean_snip = (snippet or "")[:160].strip()
     clean_owner = (owner_id or "").strip() or None
 
-    # Fallback probability deduction if not supplied explicitly
     if spam_prob is None or ham_prob is None:
         if predicted_class.lower() == "spam":
             spam_prob = round(confidence, 2)
@@ -181,12 +435,22 @@ def save_prediction(
 
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO predictions (subject, snippet, predicted_class, confidence, timestamp, spam_probability, ham_probability, risk_score, owner_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (clean_subj, clean_snip, predicted_class.lower(), confidence, now, spam_prob, ham_prob, risk_score, clean_owner))
-        conn.commit()
-        return cursor.lastrowid
+        if conn.is_postgres:
+            cursor.execute("""
+                INSERT INTO predictions (subject, snippet, predicted_class, confidence, timestamp, spam_probability, ham_probability, risk_score, owner_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (clean_subj, clean_snip, predicted_class.lower(), confidence, now, spam_prob, ham_prob, risk_score, clean_owner))
+            row = cursor.fetchone()
+            conn.commit()
+            return int(row["id"] if isinstance(row, dict) else row[0])
+        else:
+            cursor.execute("""
+                INSERT INTO predictions (subject, snippet, predicted_class, confidence, timestamp, spam_probability, ham_probability, risk_score, owner_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (clean_subj, clean_snip, predicted_class.lower(), confidence, now, spam_prob, ham_prob, risk_score, clean_owner))
+            conn.commit()
+            return cursor.lastrowid
 
 
 def get_recent_predictions(limit: int = 50, owner_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -226,11 +490,11 @@ def get_recent_predictions(limit: int = 50, owner_id: Optional[str] = None) -> L
                 """, (limit,))
             else:
                 return []
+
         rows = cursor.fetchall()
         result = []
         for r in rows:
             d = dict(r)
-            # Ensure probabilities are populated
             if d.get("spam_probability") is None or d.get("ham_probability") is None:
                 conf = d.get("confidence", 50.0)
                 if d.get("predicted_class") == "spam":
@@ -364,7 +628,7 @@ def clear_prediction_history(owner_id: Optional[str] = None) -> int:
 
 # User Authentication Persistence
 def save_user(user_id: str, name: str, email: str, password_hash: str, salt: str, role: str = "SecOps Analyst") -> Dict[str, Any]:
-    """Stores a registered user in SQLite."""
+    """Stores a registered user."""
     now = datetime.now(timezone.utc).isoformat()
     clean_email = email.strip().lower()
     clean_name = name.strip()
@@ -508,7 +772,7 @@ def update_mailbox_analysis_json(mail_id: str, analysis_json: str) -> bool:
         return cursor.rowcount > 0
 
 
-def _format_mailbox_row(r: sqlite3.Row) -> Dict[str, Any]:
+def _format_mailbox_row(r: Any) -> Dict[str, Any]:
     keys = set(r.keys())
     analysis_data = {}
     if "analysis_json" in keys and r["analysis_json"]:
@@ -520,8 +784,6 @@ def _format_mailbox_row(r: sqlite3.Row) -> Dict[str, Any]:
     top_indicators = analysis_data.get("top_indicators", [])
     chi2_summary = analysis_data.get("chi2_summary")
 
-    # If this record predates current Chi-Square explainability or has incomplete indicators,
-    # enrich it on-the-fly using the shared model pipeline without retraining.
     needs_enrichment = (
         not chi2_summary or
         (top_indicators and any(
@@ -535,7 +797,6 @@ def _format_mailbox_row(r: sqlite3.Row) -> Dict[str, Any]:
             enriched = generate_mailbox_analysis_payload(r["subject"] or "", r["body"] or "")
             if enriched and enriched.get("top_indicators"):
                 analysis_data = enriched
-                # Safely cache enriched analysis back to SQLite without altering any email metadata
                 try:
                     update_mailbox_analysis_json(r["id"], json.dumps(enriched))
                 except Exception:
@@ -682,17 +943,30 @@ def save_draft(
     now_ts = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO drafts (id, user_id, recipient_email, recipient_name, subject, body, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                recipient_email = excluded.recipient_email,
-                recipient_name = excluded.recipient_name,
-                subject = excluded.subject,
-                body = excluded.body,
-                updated_at = excluded.updated_at
-            WHERE user_id = excluded.user_id
-        """, (draft_id, user_id, recipient_email, recipient_name, subject, body, now_ts))
+        if conn.is_postgres:
+            cursor.execute("""
+                INSERT INTO drafts (id, user_id, recipient_email, recipient_name, subject, body, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(id) DO UPDATE SET
+                    recipient_email = EXCLUDED.recipient_email,
+                    recipient_name = EXCLUDED.recipient_name,
+                    subject = EXCLUDED.subject,
+                    body = EXCLUDED.body,
+                    updated_at = EXCLUDED.updated_at
+                WHERE drafts.user_id = EXCLUDED.user_id
+            """, (draft_id, user_id, recipient_email, recipient_name, subject, body, now_ts))
+        else:
+            cursor.execute("""
+                INSERT INTO drafts (id, user_id, recipient_email, recipient_name, subject, body, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    recipient_email = excluded.recipient_email,
+                    recipient_name = excluded.recipient_name,
+                    subject = excluded.subject,
+                    body = excluded.body,
+                    updated_at = excluded.updated_at
+                WHERE drafts.user_id = excluded.user_id
+            """, (draft_id, user_id, recipient_email, recipient_name, subject, body, now_ts))
         conn.commit()
     return {
         "id": draft_id,
